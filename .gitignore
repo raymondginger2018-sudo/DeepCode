@@ -1,0 +1,45 @@
+# Deep Code - 敏感文件
+.env
+*.token
+*_token*
+.deepcode/settings.json
+
+# 数据库
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# 日志
+logs/
+*.log
+*.jsonl
+
+# 缓存
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# 报告
+reports/*.docx
+reports/*.html
+charts/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 环境
+.venv/
+venv/
+env/
+
+# 第三方/大型目录
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
