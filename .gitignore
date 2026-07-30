@@ -32,6 +32,12 @@ charts/
 *.swp
 *.swo
 
+# 自动修复报告
+auto_fixes/report_*.md
+
+# 本地设置（含可能的环境变量/token）
+.deepcode/settings.local.json
+
 # 环境
 .venv/
 venv/
@@ -43,3 +49,62 @@ node_modules/
 # OS
 .DS_Store
 Thumbs.db
+
+# --- DEEPCODE 项目专用 ---
+
+# 内部工具状态
+.agents/
+.claude/
+.claude-flow/
+.swarm/
+.playwright-mcp/
+.pr_watch_state.json
+.self_evolve_last_run
+
+# 备份 & 旧配置
+BACKUP/
+config_backup_*/
+settings.json.old
+.mcp.json.old
+*.old
+
+# 二进制分析目标
+CLAUDE CODE/
+targets/
+tools/claude_dot_bun.bin
+tools/*.exe
+
+# 外部工具 (已解压的不跟踪)
+tools/ghidra_*.zip
+tools/gradle-*.zip
+tools/v8asm.zip
+tools/x64dbg.zip
+tools/apache-maven-*.zip
+tools/copilot.vsix
+
+# 构建产物
+dist-package/
+deepcode-cli-source/
+*.tgz
+*.tar.gz
+
+# 外部 MCP
+mcp-servers/
+
+# 分析临时数据
+analysis_output/
+cache_data/
+telemetry_data/
+tmp_old_de/
+
+# Office 临时文件
+~$*
+
+# 临时输出
+score_output*.txt
+
+# Patches (外部)
+patches/
+
+# DeepCode Engine MCP (独立仓库)
+deepcode-engine-mcp/
