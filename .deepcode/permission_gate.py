@@ -128,16 +128,17 @@ class PermissionGate:
         if self.mode == "acceptEdits" and tool == "Edit":
             return True
 
-        # auto — 自动接受白名单
-        if self.mode == "auto" and self._match(tool_call, self.auto_accept):
+        # 安全命令检查 (所有非 bypass/plan 模式都检查)
+        if self._match(tool_call, self.auto_accept):
             return True
 
-        # Read 在 auto 模式下也自动通过
+        # auto — 自动接受白名单扩展
         if self.mode == "auto" and tool in ("Read", "WebSearch"):
             return True
 
-        # default — 都询问
-        return self.mode == "default" and tool in ("Read", "WebSearch")
+        # plan 和 bypass 已在前面处理, 这里处理剩下的模式
+        # default/acceptEdits — 白名单以外的都询问
+        return False
 
     def needs_prompt(self, tool: str, detail: str = "") -> bool:
         """是否需要向用户确认 (True = 需要询问)"""

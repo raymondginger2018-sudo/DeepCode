@@ -1,0 +1,121 @@
+{
+  "//note": "DEEPCODE 权威 MCP 配置 — 与 .deepcode/settings.json#mcpServers 保持同步",
+  "mcpServers": {
+    "//————— 数据源 —————": "",
+    "tushareMcp": {
+      "url": "https://api.tushare.pro/mcp/?token=${TUSHARE_TOKEN}"
+    },
+
+    "//————— 浏览器 & 网络 —————": "",
+    "playwright": {
+      "command": "npx",
+      "args": ["@playwright/mcp@latest"]
+    },
+    "fetch": {
+      "command": "uvx",
+      "args": ["mcp-server-fetch"]
+    },
+
+    "//————— 文件 & 数据库 —————": "",
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "F:/DEEPCODE"]
+    },
+    "sqlite": {
+      "command": "npx",
+      "args": ["-y", "mcp-server-sqlite", "--db", "F:/DEEPCODE/database.db"]
+    },
+    "duckdb": {
+      "command": "npx",
+      "args": ["-y", "mcp-duckdb-local", "--db-path", ":memory:", "--read-write"]
+    },
+
+    "//————— GitHub —————": "",
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_PERSONAL_ACCESS_TOKEN}" }
+    },
+
+    "//————— Office & Windows —————": "",
+    "office-pro": {
+      "command": "npx",
+      "args": ["-y", "office-mcp"]
+    },
+    "winapp": {
+      "command": "npx",
+      "args": ["-y", "winapp-mcp"]
+    },
+
+    "//————— 逆向分析 —————": "",
+    "ghidra-mcp": {
+      "command": "uv",
+      "args": ["--directory", "F:/DEEPCODE/tools/ghidra-mcp", "run", "bridge-mcp-ghidra", "--transport", "stdio"],
+      "env": { "GHIDRA_MCP_URL": "http://127.0.0.1:8089", "PYTHONIOENCODING": "utf-8" }
+    },
+
+    "//————— DEEPCODE 引擎 —————": "",
+    "router-mcp": {
+      "command": "python3",
+      "args": ["F:/DEEPCODE/core/mcp_servers/router_mcp_server.py"],
+      "env": { "DEEPSEEK_API_KEY": "${DEEPSEEK_API_KEY}" }
+    },
+    "deepcode-engine": {
+      "command": "python",
+      "args": ["F:/DEEPCODE/core/mcp_servers/deepcode_engine_server.py"],
+      "env": { "TELEMETRY": "true" }
+    },
+    "sequential-thinking": {
+      "command": "node",
+      "args": ["C:/Users/raymo/AppData/Roaming/npm/node_modules/@modelcontextprotocol/server-sequential-thinking/dist/index.js"]
+    },
+
+    "//————— DEEPCODE Skills MCPs —————": "",
+    "deepcode-hooks": {
+      "command": "python",
+      "args": ["F:/DEEPCODE/.deepcode/skills/deepcode-hooks/hooks.py", "--mcp"]
+    },
+    "deepcode-sandbox": {
+      "command": "python",
+      "args": ["F:/DEEPCODE/.deepcode/skills/deepcode-sandbox/sandbox_runtime.py", "--mcp"]
+    },
+    "deepcode-streaming": {
+      "command": "python",
+      "args": ["F:/DEEPCODE/.deepcode/skills/deepcode-streaming/streaming_api.py", "--mcp"]
+    },
+    "deepcode-decompiler": {
+      "command": "python",
+      "args": ["F:/DEEPCODE/tools/mcp_decompiler_server.py"]
+    },
+    "deepcode-knowledge": {
+      "command": "python",
+      "args": ["F:/DEEPCODE/.deepcode/skills/deepcode-knowledge/knowledge_server.py"]
+    },
+    "deepcode-telemetry": {
+      "command": "python",
+      "args": ["F:/DEEPCODE/.deepcode/skills/deepcode-telemetry/telemetry.py", "--mcp"],
+      "env": { "OTEL_EXPORTER_OTLP_ENDPOINT": "", "OTEL_EXPORTER_PROMETHEUS_HOST": "127.0.0.1", "OTEL_EXPORTER_PROMETHEUS_PORT": "9464" }
+    },
+    "provider-router": {
+      "command": "python",
+      "args": ["F:/DEEPCODE/.deepcode/skills/deepcode-telemetry/provider_router.py", "--mcp"],
+      "env": { "DEEPSEEK_API_KEY": "${DEEPSEEK_API_KEY}", "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}" }
+    },
+    "deepcode-agent": {
+      "command": "python",
+      "args": ["F:/DEEPCODE/.deepcode/skills/deepcode-agent/agent_thread_manager.py", "--mcp"]
+    },
+    "deepcode-starlark": {
+      "command": "python",
+      "args": ["F:/DEEPCODE/.deepcode/skills/deepcode-starlark/starlark_engine.py", "--mcp"]
+    },
+    "deepcode-app-server": {
+      "command": "python",
+      "args": ["F:/DEEPCODE/.deepcode/skills/deepcode-sandbox/app_server.py", "--mcp"]
+    },
+    "deepcode-plugin-manager": {
+      "command": "python",
+      "args": ["F:/DEEPCODE/.deepcode/skills/deepcode-plugin-manager/plugin_manager_server.py"]
+    }
+  }
+}

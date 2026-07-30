@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 """
-Effort Router — Claude Code 风格推理深度控制
-═══════════════════════════════════════════════
-根据 effort level 自动选择模型 + Token 预算 + 推理参数。
+[DEPRECATED] Effort Router — 请改用 router-mcp MCP 服务器
+═══════════════════════════════════════════════════════════
+⚠️  此模块已废弃，功能已由 `router-mcp` MCP 服务器完全覆盖。
+   请使用 `router-mcp` 的 router_query 工具代替。
 
-Effort Level 映射:
-  low    → 快速模型, 低 Token 预算 (简单任务)
-  medium → 标准模型, 默认预算   (日常任务)
-  high   → 深度模型, 高预算     (复杂分析)
-  xhigh  → 最强模型, 最大预算   (架构设计)
-  max    → 全模型集成           (关键决策, 6模型投票)
+替代方案:
+  router-mcp 的 router_query(query, force_route="complex")
+  自动处理模型选择 + Token 预算 + 推理参数。
 
-用法:
-  from effort_router import route_effort
-  model, budget, params = route_effort("high")
+历史原因:
+  本模块基于 Claude Code 逆向分析开发，但后来发现
+  core/mcp_servers/router_mcp_server.py 已经提供了
+  更完整的模型路由功能（支持 auto-simple/complex/chan_theory/data_query）。
+
+保留原因:
+  部分测试代码和 auto_fixes 管线引用了本模块的 route_effort() 函数，
+  但新代码应直接使用 router-mcp。
 """
 
 import json

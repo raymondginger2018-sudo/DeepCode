@@ -1,35 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DeepCode Provider Abstraction — 移植自 CODEX.EXE 的多 Provider 抽象层
-═══════════════════════════════════════════════════════════════
-对标 CODEX.EXE v0.145.0:
-  - aws-smithy-runtime-1.9.5           → Provider 插件化架构
-  - apply_client_configuration          → 客户端运行时配置
-  - SharedConfigValidator               → 配置校验
-  - auth options / bearer_token         → 多认证方式
-  - model_preferences / system_prompt   → 模型偏好
+DeepCode Provider Router — 多 Provider 抽象层
+══════════════════════════════════════════════════
+对标 CODEX.EXE aws-smithy-runtime + provider.active:
+  - 5 provider types: OpenAI / Anthropic / DeepSeek / Bedrock / Vertex
+  - Hot-switch without restart
+  - Config: settings.json provider.providers + env vars
+  - 5 MCP tools: provider_switch / provider_list / provider_status / provider_chat / provider_recommend
 
-核心能力:
-  1. 统一 Provider 接口 — DeepSeek / Anthropic / OpenAI / Bedrock / Vertex
-  2. Provider 热切换 — 配置文件切换，无需重启
-  3. 认证抽象 — API Key / Bearer / OAuth / AWS IAM
-  4. 模型路由 — 根据 effort/reasoning 自动选模型
-
-对标:
-  CODEX.EXE 的 provider 系统:
-    provider.active → 当前活跃 provider
-    provider.providers.<name> → provider 配置
-    type: openai | anthropic | bedrock | vertex
-
-用法:
-  # CLI
-  python provider_router.py list
-  python provider_router.py switch deepseek
-  python provider_router.py status
-
-  # MCP Server
-  python provider_router.py --mcp
+整合状态 2026-07-29:
+  - 作为独立 MCP server 运行 (provider-router)
+  - 读取 settings.json `provider.active` 决定默认 provider
+  - router-mcp 负责智能路由决策，provider-router 负责多 provider 执行
 """
 
 import asyncio
@@ -499,27 +482,45 @@ async def run_mcp():
         },
     }
 
-    print(json.dumps({
-        "jsonrpc": "2.0", "method": "server/initialized",
-        "params": {
-            "protocol_version": "0.1.0",
-            "capabilities": {"tools": {}},
-            "server_info": {"name": "deepcode-providers", "version": "1.0.0"},
-        },
-    }), flush=True)
-
+    # ── 标准 MCP JSON-RPC 2.0 stdio ──
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
         try:
             req = json.loads(line)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            err = {
+                "jsonrpc": "2.0",
+                "error": {"code": -32700, "message": f"Parse error: {e}"},
+                "id": None,
+            }
+            sys.stdout.write(json.dumps(err, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
             continue
 
         method = req.get("method", "")
         params = req.get("params", {})
         rid = req.get("id", "")
+
+        # ── initialize ──
+        if method == "initialize":
+            resp = {
+                "jsonrpc": "2.0",
+                "id": rid,
+                "result": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": {"name": "provider-router", "version": "1.0.0"},
+                },
+            }
+            sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+            continue
+
+        # ── notifications/initialized ──
+        if method == "notifications/initialized":
+            continue
 
         if method == "tools/list":
             print(json.dumps({

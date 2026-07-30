@@ -556,27 +556,45 @@ async def run_mcp():
         },
     }
 
-    print(json.dumps({
-        "jsonrpc": "2.0", "method": "server/initialized",
-        "params": {
-            "protocol_version": "0.1.0",
-            "capabilities": {"tools": {}},
-            "server_info": {"name": "deepcode-app-server", "version": "1.0.0"},
-        },
-    }), flush=True)
-
+    # ── 标准 MCP JSON-RPC 2.0 stdio ──
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
         try:
             req = json.loads(line)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            err = {
+                "jsonrpc": "2.0",
+                "error": {"code": -32700, "message": f"Parse error: {e}"},
+                "id": None,
+            }
+            sys.stdout.write(json.dumps(err, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
             continue
 
         method = req.get("method", "")
         params = req.get("params", {})
         rid = req.get("id", "")
+
+        # ── initialize ──
+        if method == "initialize":
+            resp = {
+                "jsonrpc": "2.0",
+                "id": rid,
+                "result": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": {"name": "deepcode-app-server", "version": "1.0.0"},
+                },
+            }
+            sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+            continue
+
+        # ── notifications/initialized ──
+        if method == "notifications/initialized":
+            continue
 
         if method == "tools/list":
             print(json.dumps({

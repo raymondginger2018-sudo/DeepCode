@@ -220,6 +220,56 @@ class TelemetryEngine:
         # 确保导出目录存在
         self.export_dir.mkdir(parents=True, exist_ok=True)
 
+        # ── OpenTelemetry SDK 集成 ──
+        self._otlp_tracer = None
+        self._otlp_meter = None
+        self._init_otel_sdk()
+
+        # ── Prometheus HTTP 服务器 ──
+        self._promhttp_server = None
+        self._promhttp_thread = None
+        self._promhttp_registry = None
+
+    def _init_otel_sdk(self):
+        """初始化 OpenTelemetry SDK — 使用真实 exporter"""
+        try:
+            from opentelemetry import trace
+            from opentelemetry.sdk.trace import TracerProvider as SdkTracerProvider
+            from opentelemetry.sdk.trace.export import BatchSpanProcessor
+            from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+            from opentelemetry.sdk.resources import Resource
+
+            # 仅在有 endpoint 时初始化真实 SDK
+            if self.otlp_endpoint:
+                resource = Resource.create({
+                    "service.name": "deepcode",
+                    "service.version": "1.0.0",
+                })
+                provider = SdkTracerProvider(resource=resource)
+                exporter = OTLPSpanExporter(
+                    endpoint=f"{self.otlp_endpoint}/v1/traces",
+                    headers=self._parse_otlp_headers(),
+                    timeout=5,
+                )
+                provider.add_span_processor(BatchSpanProcessor(exporter))
+                self._otlp_tracer = provider.get_tracer("deepcode-telemetry")
+                print(f"[telemetry] OTLP SDK initialized → {self.otlp_endpoint}", file=sys.stderr, flush=True)
+        except ImportError:
+            pass  # SDK not installed, fall back to custom engine
+        except Exception as e:
+            print(f"[telemetry] OTLP SDK init failed: {e}", file=sys.stderr, flush=True)
+
+    def _parse_otlp_headers(self) -> dict:
+        """解析 OTEL_EXPORTER_OTLP_HEADERS 环境变量"""
+        headers = {}
+        raw = os.environ.get(ENV_OTLP_HEADERS, "")
+        if raw:
+            for pair in raw.split(","):
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    headers[k.strip()] = v.strip()
+        return headers
+
     # ── Trace API ──────────────────────────────────────────
 
     def start_trace(self, name: str = "") -> str:
@@ -385,22 +435,70 @@ class TelemetryEngine:
         except Exception:
             pass
 
+    def start_prometheus_server(self) -> bool:
+        """启动 Prometheus HTTP /metrics 端点 (prometheus_client)"""
+        if self._promhttp_server is not None:
+            return True
+        try:
+            from prometheus_client import start_http_server, REGISTRY, Counter, Gauge, Histogram
+            self._promhttp_registry = REGISTRY
+            self._prom_counter_calls = Counter("deepcode_tool_calls_total",
+                                               "Total tool calls", ["tool", "status"])
+            self._prom_gauge_active = Gauge("deepcode_active_spans",
+                                            "Currently active spans")
+            self._prom_histogram_duration = Histogram("deepcode_tool_duration_ms",
+                                                      "Tool call duration (ms)",
+                                                      ["tool"], buckets=[10, 50, 100, 500, 1000, 5000, 10000])
+            def _serve():
+                try:
+                    start_http_server(self.prometheus_port, addr=self.prometheus_host)
+                    print(f"[telemetry] Prometheus /metrics → http://{self.prometheus_host}:{self.prometheus_port}",
+                          file=sys.stderr, flush=True)
+                except Exception as e:
+                    print(f"[telemetry] Prometheus server failed: {e}", file=sys.stderr, flush=True)
+            self._promhttp_thread = threading.Thread(target=_serve, daemon=True)
+            self._promhttp_thread.start()
+            self._promhttp_server = True
+            return True
+        except ImportError:
+            print("[telemetry] prometheus_client not installed", file=sys.stderr, flush=True)
+            return False
+        except Exception as e:
+            print(f"[telemetry] Prometheus init error: {e}", file=sys.stderr, flush=True)
+            return False
+
     def export_prometheus(self) -> str:
-        """导出 Prometheus 格式"""
+        """导出 Prometheus 格式 (同时同步到 prometheus_client 指标)"""
+        try:
+            if hasattr(self, '_prom_counter_calls'):
+                for n, v in self._counters.items():
+                    tool = n.replace("tool.", "").replace(".calls", "").replace(".errors", "")
+                    status = "error" if "error" in n else "success"
+                    self._prom_counter_calls.labels(tool=tool, status=status).inc(v)
+                if hasattr(self, '_prom_gauge_active'):
+                    self._prom_gauge_active.set(len(self._active_spans))
+        except Exception:
+            pass
+
         lines = []
         for name, value in self._counters.items():
             safe = name.replace(".", "_").replace("-", "_")
+            lines.append(f"# TYPE deepcode_{safe} counter")
             lines.append(f"deepcode_{safe} {value}")
 
         for name, metrics in self._histograms.items():
             safe = name.replace(".", "_").replace("-", "_")
             if metrics:
+                lines.append(f"# TYPE deepcode_{safe} summary")
                 lines.append(f"deepcode_{safe}_sum {sum(metrics)}")
                 lines.append(f"deepcode_{safe}_count {len(metrics)}")
 
         lines.extend([
+            f"# TYPE deepcode_span_count gauge",
             f"deepcode_span_count {self._span_count}",
+            f"# TYPE deepcode_metric_count gauge",
             f"deepcode_metric_count {self._metric_count}",
+            f"# TYPE deepcode_export_count counter",
             f"deepcode_export_count {self._export_count}",
         ])
 
@@ -557,29 +655,56 @@ async def run_mcp():
             "description": "导出 Prometheus 格式指标",
             "inputSchema": {"type": "object", "properties": {}},
         },
+        "telemetry_start_prometheus": {
+            "description": "启动 Prometheus HTTP /metrics 服务器 (prometheus_client)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "port": {"type": "number", "description": "监听端口 (默认 9464)"},
+                },
+            },
+        },
     }
 
-    print(json.dumps({
-        "jsonrpc": "2.0", "method": "server/initialized",
-        "params": {
-            "protocol_version": "0.1.0",
-            "capabilities": {"tools": {}},
-            "server_info": {"name": "deepcode-telemetry", "version": "1.0.0"},
-        },
-    }), flush=True)
-
+    # ── 标准 MCP JSON-RPC 2.0 stdio ──
     for line in sys.stdin:
         line = line.strip()
         if not line:
             continue
         try:
             req = json.loads(line)
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            err = {
+                "jsonrpc": "2.0",
+                "error": {"code": -32700, "message": f"Parse error: {e}"},
+                "id": None,
+            }
+            sys.stdout.write(json.dumps(err, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
             continue
 
         method = req.get("method", "")
         params = req.get("params", {})
         rid = req.get("id", "")
+
+        # ── initialize ──
+        if method == "initialize":
+            resp = {
+                "jsonrpc": "2.0",
+                "id": rid,
+                "result": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": {"name": "deepcode-telemetry", "version": "1.0.0"},
+                },
+            }
+            sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+            continue
+
+        # ── notifications/initialized ──
+        if method == "notifications/initialized":
+            continue
 
         if method == "tools/list":
             print(json.dumps({
@@ -636,6 +761,12 @@ async def run_mcp():
 
                 elif name == "telemetry_prometheus":
                     result = {"metrics": t.export_prometheus()}
+
+                elif name == "telemetry_start_prometheus":
+                    port = args.get("port", t.prometheus_port)
+                    t.prometheus_port = int(port)
+                    ok = t.start_prometheus_server()
+                    result = {"ok": ok, "url": f"http://{t.prometheus_host}:{t.prometheus_port}/metrics"}
 
                 else:
                     result = {"error": f"Unknown: {name}"}
