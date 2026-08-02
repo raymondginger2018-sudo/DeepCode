@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -65,13 +67,22 @@ _COMPACT_KEEP_USER_CHARS = (
 _SUMMARIZATION_PROMPT = (
     "You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff "
     "summary for another agent that will resume this task.\n\n"
-    "Include:\n"
-    "- Current progress and key decisions made\n"
-    "- Important context, constraints, or user preferences\n"
-    "- What remains to be done (clear next steps)\n"
-    "- Any critical data, examples, file paths, or references needed to continue\n\n"
-    "Be concise, structured, and focused on helping the next agent seamlessly "
-    "continue the work."
+    "Output MUST be a single valid JSON object, no markdown code block, no "
+    "other text, with exactly these keys:\n"
+    "{\n"
+    "  \"summary\": \"one-paragraph overall progress (Chinese, <=120 chars)\",\n"
+    "  \"facts\": [\"key facts/data, one per item\"],\n"
+    "  \"decisions\": [\"decisions made, one per item\"],\n"
+    "  \"files\": [\"file paths / code locations involved\"],\n"
+    "  \"tasks\": [\"what remains to be done / next steps\"]\n"
+    "}\n\n"
+    "Rules:\n"
+    "- facts/decisions/tasks each item <=60 chars, total <=20 items\n"
+    "- Preserve numbers, file paths, stock codes, exact values\n"
+    "- Empty arrays allowed: []\n"
+    "- Include current progress, key decisions, constraints, user "
+    "preferences, critical data, and clear next steps so the next agent "
+    "can seamlessly continue the work."
 )
 _SUMMARY_PREFIX = (
     "An earlier agent worked on this task and produced the summary below of its "
@@ -1350,7 +1361,49 @@ class AgentRunner:
         if getattr(response, "finish_reason", None) == "error":
             return None
         content = getattr(response, "content", None)
-        return content.strip() if isinstance(content, str) and content.strip() else None
+        if not isinstance(content, str) or not content.strip():
+            return None
+        return self._render_summary(content.strip())
+
+    @staticmethod
+    def _render_summary(content: str) -> str:
+        """把模型输出渲染为人类可读的结构化摘要。
+
+        模型按 _SUMMARIZATION_PROMPT 输出 JSON:
+          {"summary", "facts", "decisions", "files", "tasks"}
+        解析成功 → 渲染为分段文本 (模型更好读, vault 入库也可检索);
+        解析失败 → 原样返回 (向后兼容散文式输出)。
+        """
+        text = content.strip()
+        # 剥 markdown 代码块 (容错)
+        m = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+        if m:
+            text = m.group(1).strip()
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end > start:
+            try:
+                data = json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, dict):
+                parts: list[str] = []
+                summary = str(data.get("summary", "")).strip()
+                if summary:
+                    parts.append(f"[当前进度] {summary[:300]}")
+                for label, key in (
+                    ("[关键决策]", "decisions"),
+                    ("[涉及文件]", "files"),
+                    ("[待办]", "tasks"),
+                    ("[关键事实]", "facts"),
+                ):
+                    items = data.get(key) or []
+                    items = [str(x).strip() for x in items if str(x).strip()]
+                    if items:
+                        parts.append(label)
+                        parts.extend(f"- {x[:120]}" for x in items[:8])
+                if parts:
+                    return "\n".join(parts)
+        return content.strip()
 
     @staticmethod
     def _build_compacted_history(

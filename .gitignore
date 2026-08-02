@@ -77,6 +77,10 @@ uploads/
 # secrets (use .env or environment variables instead)
 # NEVER commit real API keys; use the *.example files as templates.
 deepcode_config.json
+# DeepCode settings — may contain MCP server config with env var references;
+# real secrets live in env vars, not in this file.
+.deepcode/settings.json
+.deepcode/settings.*.json
 nanobot_config.json
 *.secrets.yaml
 *.secrets.yml
@@ -87,3 +91,12 @@ credentials.json
 .env.*
 !.env.example
 !*.env.example
+
+# deepcode-engine-mcp (v4.0 纳入版本控制, 排除运行时产物)
+!deepcode-engine-mcp/
+deepcode-engine-mcp/**/__pycache__/
+deepcode-engine-mcp/mcp_servers/data/
+
+# deepcode-cerebellum — 小脑记忆库 (含设置快照/密钥, 本地存储不推送)
+.deepcode/skills/deepcode-cerebellum/data/
+.deepcode/skills/deepcode-cerebellum/__pycache__/

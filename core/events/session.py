@@ -27,6 +27,7 @@ from loguru import logger
 from core.agent_runtime.hook import AgentHook, AgentHookContext
 from core.agent_runtime.runner import AgentRunner, AgentRunSpec
 from core.agent_runtime.tools.registry import ToolRegistry
+from core.compact_governance import HistoryVault, retrieve_context, vault_after_turn
 from core.providers.catalog import context_window_for
 from core.events.protocol import (
     AgentMessage,
@@ -115,6 +116,8 @@ class AgentSession:
         agent_context: tuple[str, str] | None = None,
         context_window_tokens: int | None = None,
         streaming: bool = False,
+        compact_vault: bool = True,
+        session_key: str | None = None,
     ) -> None:
         self._runner = AgentRunner(provider)
         self._provider = provider
@@ -150,6 +153,10 @@ class AgentSession:
         self._seq = 0
         self._busy = False
         self._current_task: asyncio.Task | None = None
+        # 压缩治理 (CompactGovernance): 压缩历史入库 + 按需检索注入。
+        # 默认开启; 任何失败静默降级, 不影响会话主流程。
+        self._session_key = session_key or f"session-{id(self):x}"
+        self._vault = HistoryVault() if compact_vault else None
 
     # -- event queue -------------------------------------------------------
 
@@ -287,12 +294,24 @@ class AgentSession:
 
         self._history.append({"role": "user", "content": text})
 
+        # 压缩治理: 按当前问题检索历史压缩片段。
+        # 注入位置放在消息序列末尾 (history 之后) — 保持 system+history
+        # 前缀稳定, 最大化 DeepSeek 上下文缓存命中率 (前缀完整匹配才命中)。
+        vault_context = ""
+        try:
+            if self._vault is not None:
+                vault_context = retrieve_context(self._vault, text, top_k=3)
+        except Exception:
+            logger.exception("compact vault retrieve failed")
+
         initial: list[dict[str, Any]] = []
         if self._system_prompt:
             initial.append({"role": "system", "content": self._system_prompt})
         for ctx in hook_contexts:
             initial.append({"role": "system", "content": ctx})
         initial.extend(self._history)
+        if vault_context:
+            initial.append({"role": "system", "content": vault_context})
 
         pre_tool_hook = post_tool_hook = permission_request_hook = stop_hook = None
         pre_compact_hook = post_compact_hook = None
@@ -358,6 +377,24 @@ class AgentSession:
 
         # Persist the turn's messages (minus the system prompt) as history.
         self._history = [m for m in result.messages if m.get("role") != "system"]
+
+        # 压缩治理: 检测本轮内置压缩摘要 → 历史入库 (可检索资产)。
+        try:
+            if self._vault is not None:
+                vault_after_turn(self._vault, self._history, self._session_key)
+        except Exception:
+            logger.exception("compact vault ingest failed")
+
+        # 压缩治理: 记录 DeepSeek 上下文缓存命中 (前缀稳定优化的效果监控)。
+        try:
+            if self._vault is not None:
+                usage = result.usage or {}
+                hit = int(usage.get("prompt_cache_hit_tokens", 0) or 0)
+                miss = int(usage.get("prompt_cache_miss_tokens", 0) or 0)
+                if hit or miss:
+                    self._vault.record_cache(hit, miss)
+        except Exception:
+            logger.exception("compact vault cache stats failed")
 
         if result.final_content:
             self._emit(AgentMessage(text=result.final_content))

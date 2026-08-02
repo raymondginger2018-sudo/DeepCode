@@ -66,7 +66,13 @@ class SessionIndex:
             Path(db_path).parent.mkdir(parents=True, exist_ok=True)
             # check_same_thread=False + our own RLock: the store touches this
             # from whatever thread services a request; we serialise ourselves.
-            conn = sqlite3.connect(str(db_path), check_same_thread=False)
+            # timeout=30 + WAL: 主进程与 spawn 分身(独立进程)并发写同一 index.db 时
+            # 等待而非立即报 SQLITE_BUSY
+            conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=30)
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.Error:
+                pass  # WAL 不可用时降级回 rollback 模式
             conn.executescript(_SCHEMA)
             conn.commit()
             self._conn = conn

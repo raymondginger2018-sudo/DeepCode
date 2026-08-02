@@ -61,7 +61,7 @@ class AutoCompactEngine:
         self,
         session_file: Optional[str] = None,
         context_window: int = 16000,
-        keep_turns: int = 3,
+        keep_turns: int = 2,
         auto_mode: bool = True,
     ):
         self.session_file = session_file or self._find_session_file()
@@ -199,7 +199,7 @@ class AutoCompactEngine:
         参数:
           model_output_tokens: 预留给模型输出的 token 数
         """
-        return self.context_window - min(model_output_tokens, 20000)
+        return max(self.context_window - min(model_output_tokens, 20000), 4096)
 
     def status(self) -> Dict:
         """返回当前状态"""

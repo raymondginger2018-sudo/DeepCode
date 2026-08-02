@@ -26,6 +26,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -86,8 +87,8 @@ def format_tokens(n: int) -> str:
 # ══════════════════════════════════════════════
 
 COMPACT_LEVELS = {
-    "micro":   {"threshold": 0.70, "keep_turns": 5,  "desc": "白名单工具结果替换"},
-    "compact": {"threshold": 0.85, "keep_turns": 3,  "desc": "LLM 理解式摘要 + compacted标记"},
+    "micro":   {"threshold": 0.70, "keep_turns": 3,  "desc": "白名单工具结果替换"},
+    "compact": {"threshold": 0.85, "keep_turns": 2,  "desc": "LLM 理解式摘要 + compacted标记"},
     "deep":    {"threshold": 0.95, "keep_turns": 1,  "desc": "激进压缩 + sessionMemory"},
 }
 
@@ -305,16 +306,28 @@ def _make_summary(content: str, use_llm: bool = False,
 
 class CompactMemory:
     """
-    跨会话记忆存储 — 对齐 SessionMemory 设计。
-    在 deep 压缩时提取关键事实到 ~/.deepcode/compact_memory.json。
+    跨会话分层记忆 — 工作记忆(当前会话) / 情景记忆(压缩摘要) / 语义记忆(事实)。
+
+    在 deep 压缩时提取关键事实:
+      - 基础层: ~/.deepcode/compact_memory.json (文件/决策关键词)
+      - 语义层: 可选注入 HistoryVault (kind='fact'), 使事实可被 TF-IDF 检索,
+        与 CompactGovernance 的压缩历史统一成一套可检索记忆。
     """
 
-    def __init__(self, project_root: str = None):
+    def __init__(self, project_root: str = None, vault: "HistoryVault" = None):
         home = os.environ.get("HOME", os.environ.get("USERPROFILE", ""))
         self._store_path = Path(home) / ".deepcode" / "compact_memory.json"
         self._project = project_root or os.getcwd()
         self._store_path.parent.mkdir(parents=True, exist_ok=True)
         self._data = self._load()
+        # 语义记忆层 — 惰性接入 HistoryVault, 失败不影响基础层
+        self._vault = vault
+        if self._vault is None:
+            try:
+                from core.compact_governance import HistoryVault
+                self._vault = HistoryVault()
+            except Exception:
+                self._vault = None
 
     def _load(self) -> dict:
         if self._store_path.exists():
@@ -360,8 +373,18 @@ class CompactMemory:
         self._data["facts"] = self._data["facts"][-200:]  # 保留最近 200 条
         self._save()
 
-    def load_context(self, session_id: str = "") -> str:
-        """加载跨会话记忆作为附加上下文"""
+        # 语义记忆层: 事实写入 vault (kind='fact'), 支持跨会话 TF-IDF 检索
+        if self._vault is not None:
+            for f in facts:
+                text = f.get("text") or f.get("path")
+                if text:
+                    self._vault.add(session_id, "fact", str(text)[:500])
+
+    def load_context(self, session_id: str = "", query: str = "") -> str:
+        """加载跨会话记忆作为附加上下文。
+
+        query 非空时, 从语义记忆层 (vault) 按相关性检索事实, 而非全量罗列。
+        """
         parts = []
         if session_id and session_id in self._data.get("sessions", {}):
             s = self._data["sessions"][session_id]
@@ -369,6 +392,18 @@ class CompactMemory:
                 f"[此前压缩] {s['last_compact']}: "
                 f"节省 {format_tokens(s['tokens_saved'])}t, "
                 f"压缩 {s['compacted_messages']} 条消息")
+
+        if query and self._vault is not None:
+            try:
+                hits = self._vault.search(query, top_k=3)
+                hits = [h for h in hits if h["kind"] == "fact"]
+                if hits:
+                    parts.append("[跨会话记忆·语义检索]")
+                    for h in hits:
+                        parts.append(f"  - {h['content'][:150]} (相关性{h['score']:.2f})")
+                    return "\n".join(parts)
+            except Exception:
+                pass  # 检索失败回退到基础层
 
         recent_facts = self._data.get("facts", [])[-20:]
         if recent_facts:
@@ -385,6 +420,10 @@ class CompactMemory:
 # ══════════════════════════════════════════════
 # CompactEngine v3.1 核心
 # ══════════════════════════════════════════════
+
+# 会话文件写锁 — 防止 PostToolUse / Stop hook 并发压缩时竞态
+_WRITE_LOCK = threading.RLock()
+
 
 class CompactEngine:
     """
@@ -469,11 +508,15 @@ class CompactEngine:
         return msgs
 
     def _write_messages(self, messages: List[dict]):
+        """原子写回会话文件 — 加锁 + fsync, 防止并发压缩竞态/半写文件。"""
         tmp = self.session_file + ".tmp"
-        with open(tmp, 'w', encoding='utf-8') as f:
-            for m in messages:
-                f.write(json.dumps(m, ensure_ascii=False) + '\n')
-        os.replace(tmp, self.session_file)
+        with _WRITE_LOCK:
+            with open(tmp, 'w', encoding='utf-8') as f:
+                for m in messages:
+                    f.write(json.dumps(m, ensure_ascii=False) + '\n')
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.session_file)
 
     def _extract_content(self, msg: dict) -> str:
         c = msg.get('content', '')
@@ -489,9 +532,31 @@ class CompactEngine:
         return str(c) if c else ''
 
     def _get_tool_name(self, msg: dict) -> str:
+        """提取工具名 — 兼容真实 JSONL 格式。
+
+        来源优先级:
+          1. meta.function.name / msg.name (内存格式)
+          2. content 为 JSON 时的 "name" 字段 (Deep Code 会话文件格式:
+             {\"ok\":..,\"name\":\"bash\",\"output\":..})
+          3. messageParams.tool_call_id 关联链内 assistant tool_calls
+        """
         meta = msg.get('meta', {})
         func = meta.get('function', {})
-        return func.get('name', msg.get('name', 'unknown'))
+        name = func.get('name') or msg.get('name')
+        if name:
+            return str(name)
+
+        content = msg.get('content')
+        if isinstance(content, str):
+            s = content.strip()
+            if s.startswith('{') and s.endswith('}'):
+                try:
+                    data = json.loads(s)
+                    if isinstance(data, dict) and data.get('name'):
+                        return str(data['name'])
+                except json.JSONDecodeError:
+                    pass
+        return 'unknown'
 
     def get_effective_window(self) -> int:
         """有效上下文窗口 — 扣除模型输出预留"""
@@ -603,6 +668,10 @@ class CompactEngine:
         messages = self._read_messages()
         if not messages:
             return {"action": "none", "error": "no_messages"}
+        # id→index 映射, 避免压缩标记时的 O(n²) 扫描
+        index_by_id = {
+            m.get("id"): i for i, m in enumerate(messages) if m.get("id")
+        }
 
         # ── 分轮次 ──
         turns: List[Tuple[Optional[dict], List[dict]]] = []
@@ -668,6 +737,10 @@ class CompactEngine:
                 for m in chain
             )
 
+            # system 消息 (系统提示/SKILL 指令) 永不压缩 — 压缩会破坏指令完整性
+            if all(m.get('role') == 'system' for m in chain):
+                continue
+
             if tool_names and not any(tn in COMPACTABLE_TOOLS for tn in tool_names):
                 continue  # 非白名单工具, 保持完整
 
@@ -681,8 +754,8 @@ class CompactEngine:
             if saved <= 0:
                 continue
 
-            # LLM 消耗控制
-            if use_llm and _llm_summarize != _make_summary:
+            # LLM 消耗控制: 摘要消耗不得超过释放的 MAX_COMPACT_BUDGET_RATIO
+            if use_llm:
                 summary_cost = count_tokens(summary)
                 if summary_cost > saved * MAX_COMPACT_BUDGET_RATIO:
                     continue
@@ -699,12 +772,11 @@ class CompactEngine:
             })
             saved_tokens += saved
 
-            # 标记整条链的所有消息
+            # 标记整条链的所有消息 (id→index 映射, O(n))
             for cm in chain:
-                for j, om in enumerate(messages):
-                    if om.get('id') == cm.get('id'):
-                        compacted_indices.append(j)
-                        break
+                j = index_by_id.get(cm.get("id"))
+                if j is not None:
+                    compacted_indices.append(j)
 
         # ── 消耗控制 ──
         if not compacted_indices:

@@ -344,7 +344,7 @@ def build_exec_command(
     argv: list[str] | None = None,
     workspace: str | os.PathLike[str],
     allow_network: bool = True,
-    shell: str = "/bin/bash",
+    shell: str | None = None,
 ) -> WrappedCommand:
     """Build the (possibly sandboxed) command a tool executor should run.
 
@@ -360,6 +360,11 @@ def build_exec_command(
     """
     if (command is None) == (argv is None):
         raise ValueError("provide exactly one of command= or argv=")
+
+    # Windows 平台: 默认 shell 用 Git Bash, 修复 WinError 2 (找不到 /bin/bash)
+    if shell is None:
+        import shutil
+        shell = shutil.which("bash") or "/bin/bash"
 
     if not sandbox_enabled():
         bare = [shell, "-c", command] if command is not None else list(argv or [])
