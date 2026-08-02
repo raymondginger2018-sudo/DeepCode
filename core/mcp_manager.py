@@ -536,7 +536,11 @@ class MCPConnectionManager:
             return {"ok": False, "reason": "授权超时", "auth_url": auth_url,
                     "redirect_uri": redirect_uri}
         # 校验 state + 换 token
-        result = self.oauth.exchange_code(server, received["code"], received["state"])
+        try:
+            result = self.oauth.exchange_code(server, received["code"], received["state"])
+        except MCPError as e:
+            return {"ok": False, "reason": f"授权回调失败: {e}",
+                    "auth_url": auth_url, "redirect_uri": redirect_uri}
         return {"ok": True, "auth_url": auth_url, "redirect_uri": redirect_uri,
                 **result}
 
