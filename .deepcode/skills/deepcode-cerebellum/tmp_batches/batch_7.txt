@@ -1,3 +1,0 @@
-\\n\\n\".join(summaries)\n+print(\"合并后总字符数:\", len(merged))\n+\n+out = \"F:/DEEPCODE/.deepcode/skills/deepcode-cerebellum/tmp_summaries.txt\"\n+with open(out, \"w\", encoding=\"utf-8\") as f:\n+    f.write(merged)\n+print(\"已保存到:\", out)\n+\n+# 2) 提取 tool 消息正文\n..."
-  }
-}
