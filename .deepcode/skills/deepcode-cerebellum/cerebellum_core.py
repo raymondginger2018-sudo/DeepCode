@@ -533,22 +533,33 @@ def _flatten(obj: Any, prefix: str = "") -> List[tuple]:
     return out
 
 
+# 设置快照语义检索的进程内 embedding 缓存 — settings_snapshots 无 embedding 列,
+# 逐条重嵌成本高 (每次 50-200ms), 用缓存避免同一快照反复重嵌
+_SNAP_EMBED_CACHE: Dict[tuple, List[float]] = {}
+
+
 def _semantic_search_snapshots(query: str, q_embed: List[float],
                                db_path: Path, limit: int = 8) -> List[Dict]:
-    """向量相似度检索设置快照 (小脑记忆: 记不清原词也能找到)"""
+    """向量相似度检索设置快照 (小脑记忆: 记不清原词也能找到)
+    轻量优化: 只扫最近 3 份快照 × 每份最多 40 个键值对, 命中向量走进程内缓存免重嵌"""
     conn = _connect(db_path)
     rows = conn.execute(
-        "SELECT scope, snapshot_json, created_at FROM settings_snapshots "
-        "ORDER BY id DESC LIMIT 6"
+        "SELECT id, scope, snapshot_json, created_at FROM settings_snapshots "
+        "ORDER BY id DESC LIMIT 3"
     ).fetchall()
     conn.close()
     scored = []
     for row in rows:
         data = json.loads(row["snapshot_json"])
-        for k, v in _flatten(data):
-            if not isinstance(v, str) or len(v) < 8:
-                continue
-            cand_embed = ollama_embed([f"{k}: {v}"])[0]
+        pairs = [(k, v) for k, v in _flatten(data)
+                 if isinstance(v, str) and len(v) >= 8][:40]
+        for k, v in pairs:
+            cache_key = (row["id"], k)
+            cand_embed = _SNAP_EMBED_CACHE.get(cache_key)
+            if cand_embed is None:
+                cand_embed = ollama_embed([f"{k}: {v}"])[0]
+                if cand_embed:
+                    _SNAP_EMBED_CACHE[cache_key] = cand_embed
             if not cand_embed:
                 continue
             sim = _cosine(q_embed, cand_embed)
@@ -643,13 +654,13 @@ class CerebellumMemory:
     def _semantic_query(self, query: str, q_embed: List[float], limit: int) -> List[Dict]:
         conn = _connect(self.db_path)
         rows = conn.execute(
-            "SELECT content, source, source_key FROM semantic_entries "
+            "SELECT content, source, source_key, embedding FROM semantic_entries "
             "ORDER BY id DESC LIMIT 200"
         ).fetchall()
         conn.close()
         scored = []
         for row in rows:
-            cand_embed = ollama_embed([row["content"]])[0]
+            cand_embed = _load_embedding(row["embedding"])
             if not cand_embed:
                 continue
             sim = _cosine(q_embed, cand_embed)
@@ -873,14 +884,15 @@ def experience_search(query: str, db_path: Path = DEFAULT_DB, limit: int = 5) ->
     q_embed = ollama_embed([query])[0]
     conn = _connect(db_path)
     rows = conn.execute(
-        "SELECT task, lesson, created_at FROM experience_entries ORDER BY id DESC LIMIT 100"
+        "SELECT task, lesson, created_at, embedding FROM experience_entries "
+        "ORDER BY id DESC LIMIT 100"
     ).fetchall()
     conn.close()
     scored = []
     for row in rows:
         sim = 0.0
         if q_embed:
-            cand = ollama_embed([f"{row['task']}: {row['lesson']}"])[0]
+            cand = _load_embedding(row["embedding"])
             if cand:
                 sim = _cosine(q_embed, cand)
         if sim > 0.4 or query.lower() in row["lesson"].lower():
@@ -1218,6 +1230,17 @@ def index_vault(db_path: Path = DEFAULT_DB) -> Dict:
 # ═══════════════════════════════════════════
 # 工具
 # ═══════════════════════════════════════════
+
+def _load_embedding(raw: Optional[str]) -> List[float]:
+    """安全解析数据库中存储的 embedding (JSON 文本) — 复用已存向量, 免重嵌"""
+    if not raw:
+        return []
+    try:
+        emb = json.loads(raw)
+        return emb if isinstance(emb, list) and emb else []
+    except Exception:
+        return []
+
 
 def _cosine(a: List[float], b: List[float]) -> float:
     if not a or not b or len(a) != len(b):
