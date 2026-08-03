@@ -1,0 +1,55 @@
+flowchart TB
+    subgraph BRN["🧠 大脑 Brain (云端 DeepSeek V4)"]
+        DS["复杂推理 / 任务执行"]
+    end
+    subgraph CBL["🧠 小脑 Cerebellum (deepcode-cerebellum)"]
+        MCP["MCP 工具层<br/>(18 个工具)"]
+        subgraph ENG["记忆引擎 (cerebellum_core.py)"]
+            L0["L0 设置层<br/>settings_snapshot / analyze"]
+            L1["L1 事实层<br/>统一收编 5 后端"]
+            L2["L2 经验层<br/>experience_record"]
+            L3["L3 会话层<br/>session_summarize"]
+            L4["L4 知识层<br/>index_vault"]
+        end
+        SEM["语义检索<br/>nomic embedding + 余弦"]
+        GRAPH["经验关联图谱<br/>experience_edges"]
+    end
+    subgraph OLL["🖥️ Ollama (小脑硬件层)"]
+        Q["qwen2.5:3b<br/>摘要/提取"]
+        R["deepseek-r1:1.5b<br/>推理/分析"]
+        E["nomic-embed-text<br/>向量化"]
+    end
+    subgraph SQL["🗄️ cerebellum.db (记忆皮层)"]
+        T1[settings_snapshots]
+        T2[settings_analyses]
+        T3[experience_entries]
+        T4[session_summaries]
+        T5[semantic_entries]
+        T6[experience_edges]
+    end
+
+    DS -->|MCP 调用| MCP
+    MCP --> L0
+    MCP --> L1
+    MCP --> L2
+    MCP --> L3
+    MCP --> L4
+    L0 --> Q
+    L0 --> R
+    L2 --> Q
+    L3 --> Q
+    L4 --> E
+    L1 --> SEM
+    SEM --> E
+    Q --> OLL
+    R --> OLL
+    E --> OLL
+    L0 -->|hash 幂等| T1
+    L0 -->|hash 幂等| T2
+    L2 -->|lesson+vector| T3
+    L3 -->|summary+vector| T4
+    L4 -->|content+vector| T5
+    L1 -->|content+vector| T5
+    L2 -->|cosine 建边| T6
+    T5 --> SEM
+    T6 --> GRAPH
