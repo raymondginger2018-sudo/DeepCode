@@ -79,11 +79,77 @@ def cmd_post_task(task: str) -> int:
         return EXIT_ERROR
 
 
-def cmd_pre_compact(session_id: str = "adhoc") -> int:
-    """PreCompact: 本地模型生成会话摘要"""
+def _read_session_context(session_id: str, max_chars: int = 4000) -> str:
+    """PreCompact: 自动读取当前会话 jsonl 提取 user/assistant 对话内容。
+
+    查找顺序:
+      1. 用户主目录 ~/.deepcode/projects/<project>/ 下与 session_id 同名的 .jsonl
+      2. 该目录下 mtime 最新的 .jsonl (排除 sessions-index.json 等非会话文件)
+      3. stdin 非空时优先用 stdin 传入的原始对话文本
+    返回截断到 max_chars 的对话文本; 找不到时返回 "" (由 session_summarize 空输入防护兜底)。
+    """
+    # 1) 显式 stdin 优先 (hook 可把原始对话通过管道传入)
     try:
-        r = session_summarize("", session_id)
-        _log(f"会话摘要已持久化 (session={session_id})")
+        if not sys.stdin.isatty():
+            data = sys.stdin.read()
+            if data and data.strip():
+                return data.strip()[:max_chars]
+    except Exception:
+        pass
+
+    projects = Path.home() / ".deepcode" / "projects"
+    if not projects.is_dir():
+        return ""
+    candidates = []
+    for proj in sorted(projects.iterdir()):
+        if not proj.is_dir():
+            continue
+        for f in proj.glob("*.jsonl"):
+            if f.name == "sessions-index.json":
+                continue
+            if session_id != "adhoc" and session_id in f.name:
+                candidates.append(f)
+        if session_id == "adhoc":
+            # 非显式 session: 收集全部候选后按 mtime 取最新
+            candidates.extend(f for f in proj.glob("*.jsonl") if f.name != "sessions-index.json")
+    if not candidates:
+        return ""
+    # 同名 session 优先; 否则 mtime 最新
+    cand = candidates[0] if len(candidates) == 1 else max(candidates, key=lambda f: f.stat().st_mtime)
+    try:
+        lines = []
+        with open(cand, "r", encoding="utf-8", errors="replace") as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    obj = json.loads(ln)
+                except Exception:
+                    continue
+                role = obj.get("role", "")
+                content = obj.get("content", "")
+                if role in ("user", "assistant") and isinstance(content, str) and content.strip():
+                    text = content.strip()
+                    # 截断超长单条消息, 保留头尾
+                    if len(text) > 600:
+                        text = text[:400] + "\n...[中略]...\n" + text[-150:]
+                    lines.append(f"[{role}] {text}")
+                if sum(len(l) for l in lines) >= max_chars:
+                    break
+        joined = "\n".join(lines)
+        return joined[:max_chars]
+    except Exception as e:
+        _log(f"读取会话文件失败: {e}")
+        return ""
+
+
+def cmd_pre_compact(session_id: str = "adhoc") -> int:
+    """PreCompact: 自动读取最近会话上下文, 本地模型生成真实摘要"""
+    try:
+        context = _read_session_context(session_id)
+        r = session_summarize(context, session_id)
+        _log(f"会话摘要已持久化 (session={session_id}, 上下文 {len(context)} 字符)")
         return EXIT_OK
     except Exception as e:
         _log(f"会话摘要失败: {e}")

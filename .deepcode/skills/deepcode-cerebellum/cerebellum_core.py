@@ -946,6 +946,20 @@ def session_summarize(context_text: str, session_id: str = "adhoc",
                       db_path: Path = DEFAULT_DB, use_llm: bool = True) -> Dict:
     """PreCompact hook: 压缩前用本地模型生成会话摘要并持久化"""
     init_db(db_path)
+    # 空输入防护: 无实际对话内容时不查缓存、不调 LLM、不入缓存, 直接规则兜底
+    if not context_text.strip():
+        summary = f"[规则摘要] 会话 {session_id} · 0 字符"
+        embed = ollama_embed([summary])[0]
+        conn = _connect(db_path)
+        conn.execute(
+            "INSERT INTO session_summaries (session_id, summary, embedding, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (session_id, summary, json.dumps(embed) if embed else None,
+             datetime.now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+        conn.close()
+        return {"ok": True, "session_id": session_id, "summary": summary}
     summary = ""
     cache_key = ""
     if use_llm:
