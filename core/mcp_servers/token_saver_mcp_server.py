@@ -790,27 +790,67 @@ def cache_stats_tool() -> Dict[str, Any]:
 
 @mcp.tool()
 def stats() -> Dict[str, Any]:
-    """Token 节省记账:总节省/模式分布/折算金额。"""
+    """Token 节省记账(科学版): 实际消耗/节省/节省率/按日统计。"""
     try:
         conn = _connect(DB_PATH)
         _init_db(conn)
         total_saved, total_ops = conn.execute(
             "SELECT COALESCE(SUM(saved_tokens),0), COUNT(*) FROM accounting").fetchone()
+        total_in, total_out = conn.execute(
+            "SELECT COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) "
+            "FROM accounting").fetchone()
         by_mode = conn.execute(
             "SELECT mode, COUNT(*), COALESCE(SUM(saved_tokens),0)"
             " FROM accounting GROUP BY mode").fetchall()
         by_op = conn.execute(
             "SELECT op, COUNT(*), COALESCE(SUM(saved_tokens),0)"
             " FROM accounting GROUP BY op ORDER BY 3 DESC").fetchall()
+        by_day = conn.execute(
+            "SELECT substr(ts,1,10) AS day, COUNT(*), "
+            "COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0), "
+            "COALESCE(SUM(saved_tokens),0) "
+            "FROM accounting GROUP BY day ORDER BY day DESC LIMIT 14").fetchall()
         conn.close()
+        total_consumed = total_in + total_out
+        original_total = total_consumed + total_saved
+        save_rate = round(total_saved / original_total * 100, 1) if original_total else 0.0
         cost_saved = total_saved / 1e6 * COST_IN
-        return {"total_saved_tokens": total_saved, "total_ops": total_ops,
-                "estimated_cost_saved_yuan": round(cost_saved, 4),
-                "cost_rate": "¥%s/M input, ¥%s/M output" % (COST_IN, COST_OUT),
-                "by_mode": [{"mode": m, "ops": c, "saved_tokens": s} for m, c, s in by_mode],
-                "by_op": [{"op": o, "ops": c, "saved_tokens": s} for o, c, s in by_op]}
+        return {
+            "total_input_tokens": total_in,
+            "total_output_tokens": total_out,
+            "total_consumed_tokens": total_consumed,
+            "total_saved_tokens": total_saved,
+            "original_tokens_without_saver": original_total,
+            "save_rate_pct": save_rate,
+            "total_ops": total_ops,
+            "estimated_cost_saved_yuan": round(cost_saved, 4),
+            "cost_rate": "¥%s/M input, ¥%s/M output" % (COST_IN, COST_OUT),
+            "by_mode": [{"mode": m, "ops": c, "saved_tokens": s} for m, c, s in by_mode],
+            "by_op": [{"op": o, "ops": c, "saved_tokens": s} for o, c, s in by_op],
+            "by_day": [{"day": d, "ops": c, "input": i, "output": o, "saved": s}
+                       for d, c, i, o, s in by_day]}
     except Exception as e:
         return {"error": str(e)}
+
+
+@mcp.tool()
+def record_llm_call(input_tokens: int = 0, output_tokens: int = 0,
+                    saved_tokens: int = 0, mode: str = "llm",
+                    op: str = "call", detail: str = "") -> Dict[str, Any]:
+    """全量记账: 记录一次 LLM 调用消耗。供外部每次调用前后调用。
+
+    input_tokens: 本次调用输入 tokens (含 history)
+    output_tokens: 本次调用输出 tokens
+    saved_tokens: 本次因缓存/压缩节省的 tokens (0 表示未节省)
+    mode: llm / cache / rule / local / cloud
+    op: call / compress / cache_hit / summarize
+    返回累计统计, 便于外部展示。
+    """
+    if input_tokens < 0 or output_tokens < 0 or saved_tokens < 0:
+        return {"error": "tokens 不能为负"}
+    _record(op, saved_tokens, mode=mode, inp=input_tokens,
+            out=output_tokens, detail=detail)
+    return stats()
 
 
 def prewarm() -> Dict[str, Any]:
