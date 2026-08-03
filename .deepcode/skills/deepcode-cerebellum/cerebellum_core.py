@@ -62,6 +62,9 @@ THREAD_DB = PROJECT_ROOT / "database.db"  # agent_threads
 # 密钥指纹: 只保留前缀几字符用于变更识别 (用户选择完整存储, 指纹用于 diff 展示)
 _SECRET_FIELDS = ("apikey", "api_key", "token", "secret", "password", "key")
 
+# 快照保留策略: 每 scope 只保留最近 N 份 (防表无限膨胀)
+SNAPSHOT_KEEP = 20
+
 
 # ═══════════════════════════════════════════
 # SQLite 初始化
@@ -113,7 +116,8 @@ def init_db(db_path: Path = DEFAULT_DB) -> None:
             source TEXT NOT NULL,             -- settings / experience / session / memory / note
             source_key TEXT,
             embedding TEXT,
-            created_at TEXT NOT NULL
+            created_at TEXT NOT NULL,
+            UNIQUE(source, source_key)        -- 语义去重: 同源同键只保留最新
         );
         CREATE INDEX IF NOT EXISTS idx_sem_source ON semantic_entries(source);
 
@@ -144,6 +148,19 @@ def init_db(db_path: Path = DEFAULT_DB) -> None:
     # 兼容旧库: 补充 relation 列 (已存在则忽略)
     try:
         conn.execute("ALTER TABLE experience_edges ADD COLUMN relation TEXT DEFAULT 'similar'")
+        conn.commit()
+    except Exception:
+        pass
+    # 兼容旧库: semantic_entries 去重 (每组 (source, source_key) 保留最新一条) 后建唯一索引
+    try:
+        conn.execute(
+            "DELETE FROM semantic_entries WHERE id NOT IN ("
+            "SELECT MAX(id) FROM semantic_entries GROUP BY source, source_key)"
+        )
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sem_unique "
+            "ON semantic_entries(source, source_key)"
+        )
         conn.commit()
     except Exception:
         pass
@@ -327,6 +344,12 @@ def settings_snapshot(scope: str = "all", db_path: Path = DEFAULT_DB) -> Dict:
             "VALUES (?, ?, ?, ?, ?)",
             (sc, str(path), json.dumps(data, ensure_ascii=False),
              h, datetime.now().isoformat(timespec="seconds")),
+        )
+        # 快照保留策略: 每 scope 只保留最近 SNAPSHOT_KEEP 份 (防表无限膨胀)
+        conn.execute(
+            "DELETE FROM settings_snapshots WHERE scope=? AND id NOT IN ("
+            "SELECT id FROM settings_snapshots WHERE scope=? ORDER BY id DESC LIMIT ?)",
+            (sc, sc, SNAPSHOT_KEEP),
         )
         conn.commit()
         results.append({
@@ -533,6 +556,10 @@ def _flatten(obj: Any, prefix: str = "") -> List[tuple]:
     return out
 
 
+# P0-2 决策: 暂不引入 sqlite-vec ANN 向量索引 — 当前数据量小 (semantic_entries≈54,
+# experience_entries≈12, settings_snapshots≈15), P0-1 修复后线性扫描 + 本地余弦 <10ms,
+# 引入 ANN 扩展复杂度 > 收益。数据量达到万级时再评估。
+
 # 设置快照语义检索的进程内 embedding 缓存 — settings_snapshots 无 embedding 列,
 # 逐条重嵌成本高 (每次 50-200ms), 用缓存避免同一快照反复重嵌
 _SNAP_EMBED_CACHE: Dict[tuple, List[float]] = {}
@@ -715,7 +742,8 @@ class CerebellumMemory:
                         embed: List[float], db_path: Optional[Path] = None):
         conn = _connect(db_path or self.db_path)
         conn.execute(
-            "INSERT INTO semantic_entries (content, source, source_key, embedding, created_at) "
+            "INSERT OR REPLACE INTO semantic_entries "
+            "(content, source, source_key, embedding, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
             (content, source, source_key,
              json.dumps(embed) if embed else None,
