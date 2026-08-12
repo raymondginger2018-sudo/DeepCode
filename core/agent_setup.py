@@ -26,6 +26,7 @@ from core.events import AgentSession
 from core.harness.policy import build_permission_engine
 from core.harness.tools import default_coding_tools
 from core.llm_runtime import get_workflow_provider
+from core.loop.guards import LoopGuards
 
 # A general coding task can legitimately need many tool-call turns. This is a
 # runaway backstop, not a task budget — the reference agents run effectively
@@ -105,6 +106,7 @@ def build_agent_session(
     injection_callback: Any | None = None,
     agent_context: tuple[str, str] | None = None,
     streaming: bool = False,
+    guards: LoopGuards | None = None,
 ) -> tuple[AgentSession, str, Any]:
     """Build an :class:`AgentSession` over ``workspace``.
 
@@ -190,6 +192,7 @@ def build_agent_session(
         hooks_engine=hooks_engine,
         agent_context=agent_context,
         streaming=streaming,
+        guards=guards,
     )
     if control is not None:
         # `session.history` is a @property (a list), so it must be wrapped in a

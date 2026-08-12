@@ -17,6 +17,7 @@ from typing import Any
 
 from core.agent_runtime.tools.base import Tool, tool_parameters
 from core.harness.agents.control import AgentControl, AgentLimitError
+from core.loop.guards import delegation_admission
 
 
 def _parse_fork_turns(value: Any) -> str | int:
@@ -94,6 +95,20 @@ class SpawnAgentTool(Tool):
         name = str(kwargs.get("name") or "").strip() or None
         isolate = bool(kwargs.get("isolate", True))
         fork_turns = _parse_fork_turns(kwargs.get("fork_turns"))
+        # Delegation admission (REASONIX §1.10 delegationAdmission 适配):
+        # spawn_agent 是本地并发委派（C2），默认允许自包含任务；仅拒绝那些
+        # 引用父上下文但未继承对话的任务（子代理看不到你的消息）。
+        decision, reason = delegation_admission(task, fork_turns=str(fork_turns))
+        if decision == "deny":
+            return (
+                "Error: delegation denied (local_fix_no_external_need). "
+                f"The subtask references the parent conversation but "
+                f"fork_turns is '{fork_turns}', so the sub-agent inherits no "
+                "context and cannot act on those references. Either do the "
+                "work yourself, or rewrite the task to be self-contained, or "
+                "pass fork_turns='all'/'<N>' to inherit the needed context. "
+                f"(reason: {reason})"
+            )
         try:
             agent_id = self._control.spawn(
                 task, name=name, isolate=isolate, fork_turns=fork_turns

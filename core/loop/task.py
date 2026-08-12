@@ -29,8 +29,15 @@ from core.agent_setup import build_agent_session
 from core.events import UserInput
 from core.harness.snapshot import Snapshotter
 from core.loop.backpressure import TestResult, run_tests
+from core.loop.guards import LoopGuards
 from core.loop.policy import decide
-from core.loop.state import STATUS_ERROR, STATUS_EXHAUSTED, LoopState, RoundRecord
+from core.loop.state import (
+    STATUS_ERROR,
+    STATUS_EXHAUSTED,
+    STATUS_STALLED,
+    LoopState,
+    RoundRecord,
+)
 
 # (workspace, prompt) -> (stop_reason, final_text)
 RoundRunner = Callable[[str, str], Awaitable[tuple[str, str]]]
@@ -53,12 +60,23 @@ class LoopResult:
         return self.state.status == STATUS_SUCCEEDED
 
 
-def _make_default_round_runner(model: str | None, max_iterations: int) -> RoundRunner:
-    """A round runner that runs one turn of a fresh AgentSession per round."""
+def _make_default_round_runner(
+    model: str | None,
+    max_iterations: int,
+    guards: LoopGuards | None = None,
+) -> RoundRunner:
+    """A round runner that runs one turn of a fresh AgentSession per round.
+
+    The same ``guards`` instance is passed into every round's session so
+    ProgressGuard / StormBreaker state survives across rounds (REASONIX P4).
+    """
 
     async def _run(workspace: str, prompt: str) -> tuple[str, str]:
         session, _model, _engine = build_agent_session(
-            workspace=workspace, model=model, max_iterations=max_iterations
+            workspace=workspace,
+            model=model,
+            max_iterations=max_iterations,
+            guards=guards,
         )
         final_text = ""
         stop_reason = "completed"
@@ -86,13 +104,18 @@ class LoopTask:
         round_runner: RoundRunner | None = None,
         test_runner: TestRunner = run_tests,
         on_event: EventHook | None = None,
+        guards: LoopGuards | None = None,
     ) -> None:
         self.goal = goal
         self.workspace = workspace
         self.test_command = test_command
         self.max_rounds = max(1, max_rounds)
+        # REASONIX P4: LoopTask owns one guards instance and reuses it across
+        # every round's fresh AgentSession, so ProgressGuard / StormBreaker
+        # state (streaks, circuit-breaker counts) survives across rounds.
+        self._guards = guards or LoopGuards()
         self._round_runner = round_runner or _make_default_round_runner(
-            model, max_iterations
+            model, max_iterations, self._guards
         )
         self._test_runner = test_runner
         self._on_event = on_event
@@ -144,6 +167,15 @@ class LoopTask:
             state.save()
             if self._on_event is not None:
                 self._on_event(state, record, test)
+
+            # REASONIX P2: if the storm breaker (repeated identical tool-sequence
+            # failures) has tripped, short-circuit to stalled — don't burn more
+            # test budget re-detecting the same spinning condition. The policy's
+            # test-signature stall check remains as a test-level fallback.
+            if self._guards.storm.blocked:
+                state.finish(STATUS_STALLED, "storm breaker tripped")
+                state.save()
+                return LoopResult(state)
 
             decision = decide(state)
             if decision.stop:

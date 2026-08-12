@@ -13,9 +13,20 @@ Public surface:
 - :func:`~core.loop.backpressure.run_tests` / :class:`~core.loop.backpressure.TestResult`
 - :func:`~core.loop.policy.decide` / :class:`~core.loop.policy.Decision`
 - :class:`~core.loop.task.LoopTask` / :class:`~core.loop.task.LoopResult`
+- :class:`~core.loop.guards.EvidenceLedger` / :class:`~core.loop.guards.ProgressGuard`
+- :class:`~core.loop.guards.StormBreaker` / :class:`~core.loop.guards.LoopGuards`
+- :func:`~core.loop.guards.delegation_admission`
 """
 
 from core.loop.backpressure import TestResult, run_tests
+from core.loop.guards import (
+    EvidenceLedger,
+    GuardIntervention,
+    LoopGuards,
+    ProgressGuard,
+    StormBreaker,
+    delegation_admission,
+)
 from core.loop.policy import Decision, decide
 from core.loop.state import LoopState, RoundRecord
 
@@ -26,4 +37,11 @@ __all__ = [
     "run_tests",
     "Decision",
     "decide",
+    # REASONIX 反漫游守卫（P3.5）
+    "EvidenceLedger",
+    "GuardIntervention",
+    "ProgressGuard",
+    "StormBreaker",
+    "LoopGuards",
+    "delegation_admission",
 ]

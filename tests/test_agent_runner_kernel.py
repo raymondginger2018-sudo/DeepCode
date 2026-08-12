@@ -22,6 +22,12 @@ if str(ROOT) not in sys.path:
 from core.agent_runtime.runner import AgentRunner, AgentRunSpec  # noqa: E402
 from core.agent_runtime.tools.base import Tool, tool_parameters  # noqa: E402
 from core.agent_runtime.tools.registry import ToolRegistry  # noqa: E402
+from core.loop.guards import (  # noqa: E402
+    DeliveryPolicyGates,
+    LoopGuards,
+    ProgressGuard,
+    SCORE_REPEATED_CALLS,
+)
 from core.providers.base import LLMResponse, ToolCallRequest  # noqa: E402
 
 
@@ -277,3 +283,115 @@ async def test_max_injection_cycles_override_extends_continuation():
     assert provider.calls == 9
     assert result.stop_reason == "completed"
     assert result.final_content == "final"
+
+
+# -- P1: guard_event_callback（REASONIX 守卫事件遥测） -------------------------
+
+
+@pytest.mark.asyncio
+async def test_guard_event_callback_blocked_short_circuit():
+    """ProgressGuard 熔断（N==6 强制收尾）时触发 kind='blocked' 事件。"""
+    pg = ProgressGuard()
+    for _ in range(6):
+        pg.observe(SCORE_REPEATED_CALLS)
+    assert pg.blocked
+
+    events: list[dict[str, Any]] = []
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(id="c1", name="echo", arguments={"text": "hi"})
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(content="final", finish_reason="stop"),
+        ]
+    )
+    result = await AgentRunner(provider).run(
+        _spec(
+            provider,
+            guards=LoopGuards(progress=pg),
+            guard_event_callback=events.append,
+        )
+    )
+
+    blocked = [e for e in events if e["kind"] == "blocked"]
+    assert len(blocked) == 1, events
+    assert blocked[0]["streak"] == 6
+    assert "no new evidence" in blocked[0]["message"]
+    # 工具执行被短路：echo 从未真正运行，模型直接收到错误并收尾。
+    assert result.stop_reason == "completed"
+
+
+@pytest.mark.asyncio
+async def test_guard_event_callback_injection():
+    """连续相同调用触发 nudge 注入时发出 kind='injection' 事件。"""
+    events: list[dict[str, Any]] = []
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(id="c1", name="echo", arguments={"text": "hi"})
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(id="c2", name="echo", arguments={"text": "hi"})
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(id="c3", name="echo", arguments={"text": "hi"})
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(content="final", finish_reason="stop"),
+        ]
+    )
+    result = await AgentRunner(provider).run(
+        _spec(provider, guards=LoopGuards(), guard_event_callback=events.append)
+    )
+
+    # streak 0→1→2：第三轮（streak==2）触发 nudge。
+    injections = [e for e in events if e["kind"] == "injection"]
+    assert len(injections) >= 1, events
+    assert "[progress guard]" in injections[0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_guard_event_callback_tool_block():
+    """配送策略拒绝工具时触发 kind='tool_block' 事件（check_tool 阻断）。"""
+    events: list[dict[str, Any]] = []
+    provider = ScriptedProvider(
+        [
+            LLMResponse(
+                content="",
+                tool_calls=[
+                    ToolCallRequest(id="c1", name="echo", arguments={"text": "hi"})
+                ],
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(content="final", finish_reason="stop"),
+        ]
+    )
+    result = await AgentRunner(provider).run(
+        _spec(
+            provider,
+            guards=LoopGuards(
+                delivery=DeliveryPolicyGates(policies={"echo": "deny"})
+            ),
+            guard_event_callback=events.append,
+        )
+    )
+
+    blocks = [e for e in events if e["kind"] == "tool_block"]
+    assert len(blocks) == 1, events
+    assert blocks[0]["tool"] == "echo"
+    assert "[delivery]" in blocks[0]["message"]

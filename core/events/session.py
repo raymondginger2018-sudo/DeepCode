@@ -47,6 +47,7 @@ from core.events.protocol import (
     summarize_call,
     summarize_result,
 )
+from core.loop.guards import LoopGuards
 from core.providers.base import LLMProvider
 
 _DEFAULT_MAX_ITERATIONS = 50
@@ -118,6 +119,7 @@ class AgentSession:
         streaming: bool = False,
         compact_vault: bool = True,
         session_key: str | None = None,
+        guards: LoopGuards | None = None,
     ) -> None:
         self._runner = AgentRunner(provider)
         self._provider = provider
@@ -157,6 +159,11 @@ class AgentSession:
         # 默认开启; 任何失败静默降级, 不影响会话主流程。
         self._session_key = session_key or f"session-{id(self):x}"
         self._vault = HistoryVault() if compact_vault else None
+        # Loop guards (REASONIX P3.5/P3.6 port): anti-wandering circuit
+        # breakers observed across tool batches; None keeps the feature dormant
+        # at zero cost. LoopTask passes the same instance every round so
+        # ProgressGuard/StormBreaker state survives across rounds.
+        self._guards = guards
 
     # -- event queue -------------------------------------------------------
 
@@ -241,6 +248,21 @@ class AgentSession:
         except Exception:
             logger.exception("start hook failed")
             return None
+
+    async def _run_end_hook(self, reason: str = "complete") -> None:
+        """Run SessionEnd hooks at the close of a turn.
+
+        Notification-only: a failure is logged and never crashes the turn.
+        Fired on every terminal path (complete / interrupted / error) so
+        summaries can be persisted even when compaction never ran.
+        """
+        engine = self._hooks_engine
+        if engine is None or not engine.has_event("SessionEnd"):
+            return
+        try:
+            await engine.run_session_end(reason=reason)
+        except Exception:  # noqa: BLE001 - hooks never crash a turn
+            logger.exception("session end hook failed")
 
     async def _run_prompt_hooks(
         self, text: str, hook_contexts: list[str]
@@ -352,6 +374,7 @@ class AgentSession:
             stop_hook=stop_hook,
             pre_compact_hook=pre_compact_hook,
             post_compact_hook=post_compact_hook,
+            guards=self._guards,
         )
 
         try:
@@ -361,6 +384,7 @@ class AgentSession:
             self._emit(TaskComplete(final_text=None, stop_reason="interrupted"))
             self._busy = False
             self._current_task = None
+            await self._run_end_hook("interrupted")
             return
         except Exception as exc:  # noqa: BLE001
             # The runner should return errors as data, but a truly unexpected
@@ -371,6 +395,7 @@ class AgentSession:
             self._emit(TaskComplete(final_text=None, stop_reason="error"))
             self._busy = False
             self._current_task = None
+            await self._run_end_hook("error")
             return
         finally:
             self._current_task = None
@@ -406,3 +431,4 @@ class AgentSession:
             )
         )
         self._busy = False
+        await self._run_end_hook("complete")

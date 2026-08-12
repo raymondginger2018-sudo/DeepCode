@@ -21,7 +21,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core.loop.backpressure import run_tests  # noqa: E402
+from core.loop.backpressure import TestResult, run_tests  # noqa: E402
+from core.loop.guards import LoopGuards  # noqa: E402
 from core.loop.policy import decide  # noqa: E402
 from core.loop.state import (  # noqa: E402
     STATUS_EXHAUSTED,
@@ -259,3 +260,109 @@ def test_loop_emits_round_events(tmp_path):
     )
     asyncio.run(task.run())
     assert seen and seen[0][0] == 0
+
+
+# -- P2: StormBreaker 短路 → STATUS_STALLED ------------------------------------
+
+
+def test_loop_storm_breaker_short_circuits_to_stalled(tmp_path):
+    """StormBreaker 熔断后，LoopTask 短路到 stalled 而非烧更多测试预算。"""
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    _write_project(ws, "def add(a, b):\n    return a + b\n")
+
+    guards = LoopGuards()
+    tc = type("TC", (), {"name": "bash", "arguments": {"command": "x"}})()
+    for _ in range(4):  # 4 次相同失败签名 → count > max_failures(3) → 熔断
+        guards.observe_batch(
+            [tc],
+            ["Error: boom"],
+            [{"name": "bash", "status": "error"}],
+        )
+    assert guards.storm.blocked
+
+    async def noop(workspace: str, prompt: str):
+        return "completed", "ok"
+
+    task = LoopTask(
+        goal="g",
+        workspace=str(ws),
+        round_runner=noop,
+        test_runner=lambda w, c: TestResult(
+            ran=True,
+            passed=False,
+            returncode=1,
+            summary="boom",
+            output_tail="boom",
+            signature="boom",
+        ),
+        guards=guards,
+        max_rounds=3,
+    )
+    result = asyncio.run(task.run())
+    assert result.state.status == STATUS_STALLED
+    assert "storm breaker" in (result.state.stop_reason or "")
+    assert result.state.round_count == 1
+
+
+# -- P4: LoopTask 默认装配 / 复用 guards ---------------------------------------
+
+
+def test_loop_task_default_assembles_guards(tmp_path):
+    """未传 guards 时 LoopTask 默认装配一个 LoopGuards 实例。"""
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    task = LoopTask(goal="g", workspace=str(ws), max_rounds=1)
+    assert isinstance(task._guards, LoopGuards)
+
+
+def test_loop_task_reuses_passed_guards(tmp_path):
+    """传入 guards 时 LoopTask 复用同一实例（跨轮状态持久的前提）。"""
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    guards = LoopGuards()
+    task = LoopTask(goal="g", workspace=str(ws), guards=guards, max_rounds=1)
+    assert task._guards is guards
+
+
+def test_default_round_runner_forwards_guards(tmp_path, monkeypatch):
+    """默认 round runner 把同一 guards 实例传给每轮的 build_agent_session。"""
+    ws = tmp_path / "proj"
+    ws.mkdir()
+    guards = LoopGuards()
+    captured: dict = {}
+
+    class _FakeTaskComplete:
+        type = "task_complete"
+        final_text = "ok"
+        stop_reason = "completed"
+
+    class _FakeMsg:
+        msg = _FakeTaskComplete()
+
+    class _FakeSession:
+        async def run_stream(self, message):
+            yield _FakeMsg()
+
+    def fake_build_agent_session(**kwargs):
+        captured.update(kwargs)
+        return _FakeSession(), "fake-model", None
+
+    monkeypatch.setattr("core.loop.task.build_agent_session", fake_build_agent_session)
+    task = LoopTask(
+        goal="g",
+        workspace=str(ws),
+        guards=guards,
+        max_rounds=1,
+        test_runner=lambda w, c: TestResult(
+            ran=True,
+            passed=True,
+            returncode=0,
+            summary="ok",
+            output_tail="",
+            signature="",
+        ),
+    )
+    result = asyncio.run(task.run())
+    assert captured.get("guards") is guards
+    assert result.state.status == STATUS_SUCCEEDED
