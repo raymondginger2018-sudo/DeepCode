@@ -43,9 +43,11 @@ class ModelInfo:
     ``context_window`` is the total token budget the model accepts (input +
     output). ``max_output_tokens`` is the largest completion it will emit.
     Costs are USD per 1M tokens, or ``None`` when unknown (e.g. a local or
-    unpriced model). ``source`` records where the value came from — ``seed``,
-    ``family:<prefix>``, ``default``, or ``snapshot`` — so a surprising
-    compaction budget is traceable to its origin.
+    unpriced model). ``cache_hit_cost_per_1m`` is the prompt-cache hit price
+    (models.dev ``cost.cache_read``) — DeepSeek charges 1/50~1/120 of the
+    input price for prefix-cache hits. ``source`` records where the value came
+    from — ``seed``, ``family:<prefix>``, ``default``, or ``snapshot`` — so a
+    surprising compaction budget is traceable to its origin.
     """
 
     id: str
@@ -53,6 +55,7 @@ class ModelInfo:
     max_output_tokens: int
     input_cost_per_1m: float | None = None
     output_cost_per_1m: float | None = None
+    cache_hit_cost_per_1m: float | None = None
     source: str = "seed"
 
 
@@ -95,9 +98,11 @@ _SEED: dict[str, ModelInfo] = {
     "kimi-k2": ModelInfo("kimi-k2", 256_000, 128_000, 0.60, 2.5),
     "kimi-k2.5": ModelInfo("kimi-k2.5", 256_000, 128_000, 0.60, 2.5),
     "kimi-k2.6": ModelInfo("kimi-k2.6", 256_000, 128_000, 0.60, 2.5),
-    # DeepSeek.
-    "deepseek-v3": ModelInfo("deepseek-v3", 128_000, 8_192, 0.27, 1.10),
-    "deepseek-r1": ModelInfo("deepseek-r1", 128_000, 65_536, 0.55, 2.19),
+    # DeepSeek (V4 价格为逆向恢复官方牌价; cache_hit 为前缀缓存命中价, flash 1:50、pro 1:120 价差).
+    "deepseek-v3": ModelInfo("deepseek-v3", 128_000, 8_192, 0.27, 1.10, 0.07),
+    "deepseek-r1": ModelInfo("deepseek-r1", 128_000, 65_536, 0.55, 2.19, 0.14),
+    "deepseek-v4-flash": ModelInfo("deepseek-v4-flash", 1_000_000, 8_192, 0.14, 0.28, 0.0028),
+    "deepseek-v4-pro": ModelInfo("deepseek-v4-pro", 1_000_000, 8_192, 0.435, 0.87, 0.003625),
     # Alibaba Qwen.
     "qwen3-max": ModelInfo("qwen3-max", 256_000, 32_768, 1.2, 6.0),
     "qwen3-coder": ModelInfo("qwen3-coder", 256_000, 65_536, 1.0, 5.0),
@@ -198,6 +203,7 @@ def _coerce_info(model_id: str, entry: dict[str, Any]) -> ModelInfo | None:
         max_output_tokens=int(output),
         input_cost_per_1m=entry.get("input_cost_per_1m", cost.get("input")),
         output_cost_per_1m=entry.get("output_cost_per_1m", cost.get("output")),
+        cache_hit_cost_per_1m=entry.get("cache_hit_cost_per_1m", cost.get("cache_read")),
         source="snapshot",
     )
 

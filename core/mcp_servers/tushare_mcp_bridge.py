@@ -38,8 +38,6 @@ def _resolve_token() -> str:
 
     # 从 .env 兜底读取
     env_candidates = [
-        os.path.join(os.path.dirname(__file__), "..", "..",
-                     "DeepCode (CLONE)", "quant_trading", ".env"),
         os.path.join(os.path.dirname(__file__), "..", "..", "quant_trading", ".env"),
     ]
     for env_path in env_candidates:

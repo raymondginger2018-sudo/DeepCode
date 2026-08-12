@@ -22,10 +22,16 @@ import re
 import sqlite3
 import sys
 import time
-import urllib.request
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# 共享 Ollama 接入层 (core/ollama_client.py) — 统一小脑/router_cascade/token_saver/ollama-mcp 的 HTTP 调用
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent  # F:/DEEPCODE
+sys.path.insert(0, str(_PROJECT_ROOT))
+from core.ollama_client import embed as _oc_embed
+from core.ollama_client import generate as _oc_generate
+from core.ollama_client import status as _oc_status
 
 # ═══════════════════════════════════════════
 # 路径与配置
@@ -37,10 +43,13 @@ DATA_DIR.mkdir(exist_ok=True)
 
 DEFAULT_DB = DATA_DIR / "cerebellum.db"
 OLLAMA_HOST = os.environ.get("CEREBELLUM_OLLAMA_HOST", "http://127.0.0.1:11434")
-# 主 LLM: phi4-mini 指令遵循好、中文流利、体积小; 可用 CEREBELLUM_LLM_MODEL 覆盖
-LLM_MODEL = os.environ.get("CEREBELLUM_LLM_MODEL", "phi4-mini")
+# 主 LLM: qwen2.5:3b 实测完胜 qwen3:4b (2026-08-06 A/B 对比: 快4倍, 严格四段式 200字内,
+# qwen3:4b 即使 think=False 仍输出 510 字符超预算且截断)。可用 CEREBELLUM_LLM_MODEL 覆盖
+LLM_MODEL = os.environ.get("CEREBELLUM_LLM_MODEL", "qwen2.5:3b")
 REASON_MODEL = os.environ.get("CEREBELLUM_REASON_MODEL", "deepseek-r1:1.5b")
 EMBED_MODEL = os.environ.get("CEREBELLUM_EMBED_MODEL", "bge-m3")
+# 代码类任务专用模型 (SRC 场景: PoC/payload/漏洞代码片段提炼)。可用 CEREBELLUM_CODER_MODEL 覆盖
+CODER_MODEL = os.environ.get("CEREBELLUM_CODER_MODEL", "qwen2.5-coder:3b")
 
 PROJECT_ROOT = SKILL_DIR.parent.parent.parent  # F:/DEEPCODE
 SETTINGS_FILES = [
@@ -64,6 +73,55 @@ _SECRET_FIELDS = ("apikey", "api_key", "token", "secret", "password", "key")
 
 # 快照保留策略: 每 scope 只保留最近 N 份 (防表无限膨胀)
 SNAPSHOT_KEEP = 20
+
+
+# ═══════════════════════════════════════════
+# 时态感知检索 (刀二) — 对标 kairos Causal Perception Bus
+# ═══════════════════════════════════════════
+
+class ClockDomainError(Exception):
+    """时钟域违例 — 检索访问了 cutoff 之后的记忆 (未来函数泄漏)。
+
+    对标 kairos `ClockDomainError`: append-only 单调总线上,
+    `as_of(cutoff)` 只能读到 `ts <= cutoff` 的感知, 违规访问直接抛出。
+    本引擎语义: strict=True 时, 若一条本会命中 (语义相似) 的记忆
+    因 created_at > cutoff 被过滤, 说明存在未来泄漏, 抛出该异常。
+    """
+
+
+def _parse_cutoff(as_of: Optional[str]) -> Optional[datetime]:
+    """解析 as_of 截止时间。None / 非法输入 → None (不限制, 保持向后兼容)。"""
+    if as_of is None:
+        return None
+    if isinstance(as_of, datetime):
+        return as_of
+    s = str(as_of).strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _ts_after(ts_str: Optional[str], cutoff: Optional[datetime]) -> bool:
+    """created_at 字符串是否严格晚于 cutoff。无法解析 → False (放行)。
+
+    内部时间戳 (created_at) 均为本地 naive 时间; as_of 可能带时区 (如 ...Z),
+    统一剥离 tzinfo 后再比较, 避免 naive/aware 混比出错。
+    """
+    if cutoff is None or not ts_str:
+        return False
+    try:
+        ts = datetime.fromisoformat(ts_str)
+        if ts.tzinfo is not None:
+            ts = ts.replace(tzinfo=None)
+        c = cutoff
+        if c.tzinfo is not None:
+            c = c.replace(tzinfo=None)
+        return ts > c
+    except ValueError:
+        return False
 
 
 # ═══════════════════════════════════════════
@@ -164,6 +222,74 @@ def init_db(db_path: Path = DEFAULT_DB) -> None:
         conn.commit()
     except Exception:
         pass
+    # 兼容旧库: session_summaries 补 consolidated 列 (Dreaming 归档标记)
+    try:
+        conn.execute("ALTER TABLE session_summaries ADD COLUMN consolidated INTEGER DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass
+
+    # 记忆进化引擎表 (Dreaming / 反馈闭环 / Skill 进化信号 / 评测)
+    # 与 cerebellum_evolution.py 的 _init_evolution_db 保持一致 (幂等)
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS dreaming_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            items_scanned INTEGER DEFAULT 0,
+            clusters INTEGER DEFAULT 0,
+            merged INTEGER DEFAULT 0,
+            archived INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS consolidated_memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL,
+            source_ids TEXT NOT NULL,
+            content TEXT NOT NULL,
+            embedding TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_cons_kind ON consolidated_memories(kind);
+        CREATE TABLE IF NOT EXISTS feedback_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            target_type TEXT NOT NULL,
+            target_key TEXT NOT NULL,
+            rating INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            comment TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_fb_target ON feedback_entries(target_type, target_key);
+        CREATE TABLE IF NOT EXISTS skill_signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            skill_name TEXT NOT NULL,
+            signal_type TEXT NOT NULL,
+            context TEXT DEFAULT '',
+            error TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sig_skill ON skill_signals(skill_name, signal_type);
+        CREATE TABLE IF NOT EXISTS skill_evolution_proposals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            skill_name TEXT NOT NULL,
+            signal_count INTEGER DEFAULT 0,
+            failure_pattern TEXT DEFAULT '',
+            suggested_change TEXT DEFAULT '',
+            status TEXT DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_prop_status ON skill_evolution_proposals(status);
+        CREATE TABLE IF NOT EXISTS benchmark_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            btype TEXT NOT NULL,
+            metrics_json TEXT NOT NULL,
+            report_path TEXT DEFAULT '',
+            created_at TEXT NOT NULL
+        );
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -172,24 +298,10 @@ def init_db(db_path: Path = DEFAULT_DB) -> None:
 # Ollama 通道 (小脑硬件层)
 # ═══════════════════════════════════════════
 
-def _ollama_post(path: str, payload: Dict, timeout: int = 120) -> Dict:
-    req = urllib.request.Request(
-        f"{OLLAMA_HOST}{path}",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
 def ollama_embed(texts: List[str]) -> List[List[float]]:
-    """nomic-embed-text 向量化 (支持批处理)"""
+    """bge-m3 向量化 (支持批处理, 统一走共享 core/ollama_client.py)"""
     try:
-        resp = _ollama_post("/api/embed", {
-            "model": EMBED_MODEL, "input": texts,
-        })
-        return resp.get("embeddings", [])
+        return _oc_embed(OLLAMA_HOST, EMBED_MODEL, texts, timeout=60)
     except Exception:
         return [[] for _ in texts]
 
@@ -198,7 +310,7 @@ def ollama_generate(prompt: str, model: str = LLM_MODEL, system: str = "",
                     temperature: float = 0.3, max_tokens: int = 512,
                     timeout: int = 120, retries: int = 1,
                     enable_thinking: Optional[bool] = None) -> str:
-    """本地模型生成 (默认 qwen3:4b, 零成本)
+    """本地模型生成 (默认 qwen2.5:3b, 零成本)
 
     enable_thinking: qwen3 等思考模型的控制开关; None=不控制, False=关闭思考
                      (摘要/分类任务建议 False, 避免思考过程吃掉 token 预算)
@@ -207,19 +319,12 @@ def ollama_generate(prompt: str, model: str = LLM_MODEL, system: str = "",
     last_err = ""
     for attempt in range(retries + 1):
         try:
-            options = {"temperature": temperature, "num_predict": max_tokens}
-            payload = {
-                "model": model, "prompt": prompt, "system": system,
-                "stream": False, "options": options,
-            }
-            if enable_thinking is not None:
-                # qwen3 顶层 think 参数 (options 内不生效)
-                payload["think"] = enable_thinking
-            resp = _ollama_post("/api/generate", payload, timeout=timeout)
-            out = (resp.get("response") or "").strip()
-            if not out and resp.get("thinking"):
-                # qwen3 等 thinking 模型兜底: response 为空时取思考内容
-                out = (resp.get("thinking") or "").strip()[-200:]
+            out = _oc_generate(
+                OLLAMA_HOST, model, prompt,
+                system=system, temperature=temperature,
+                max_tokens=max_tokens, timeout=timeout,
+                think=enable_thinking,
+            )
             if out:
                 return _strip_thinking(out)
             last_err = "空响应"
@@ -252,18 +357,14 @@ def _strip_thinking(text: str) -> str:
 
 
 def ollama_status() -> Dict:
-    """小脑健康检查"""
-    try:
-        req = urllib.request.Request(f"{OLLAMA_HOST}/api/tags", method="GET")
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            tags = json.loads(resp.read().decode("utf-8"))
-        models = [m["name"] for m in tags.get("models", [])]
-        return {
-            "ok": True, "host": OLLAMA_HOST, "models": models,
-            "llm": LLM_MODEL, "reason": REASON_MODEL, "embed": EMBED_MODEL,
-        }
-    except Exception as e:
-        return {"ok": False, "host": OLLAMA_HOST, "error": str(e)}
+    """小脑健康检查 (统一走共享 core/ollama_client.py)"""
+    info = _oc_status(OLLAMA_HOST)
+    if info.get("ok"):
+        info.update({
+            "llm": LLM_MODEL, "reason": REASON_MODEL,
+            "coder": CODER_MODEL, "embed": EMBED_MODEL,
+        })
+    return info
 
 
 # ═══════════════════════════════════════════
@@ -662,8 +763,15 @@ class CerebellumMemory:
             return content.split(": ", 1)[1] if ": " in content else content
         return None
 
-    def search(self, query: str, backend: str = "auto", limit: int = 10) -> Dict:
-        """语义优先 + 关键词兜底"""
+    def search(self, query: str, backend: str = "auto", limit: int = 10,
+               as_of: Optional[str] = None, strict: bool = False) -> Dict:
+        """语义优先 + 关键词兜底
+
+        as_of: 时态截止 (ISO 时间字符串) — 只检索 created_at <= as_of 的记忆,
+               默认 None = 不限制 (完整记忆)。对标 kairos as_of(cutoff) 语义。
+        strict: True 时, 若存在本会命中但因 as_of 被过滤的未来记忆,
+                抛出 ClockDomainError (未来函数泄漏检测); 默认 False = 静默过滤。
+        """
         kw_hits = []
         if self._mm is not None:
             try:
@@ -672,16 +780,18 @@ class CerebellumMemory:
                 pass
         # 语义检索 semantic_entries
         q_embed = ollama_embed([query])[0]
-        sem_hits = self._semantic_query(query, q_embed, limit) if q_embed else []
+        sem_hits = self._semantic_query(query, q_embed, limit, as_of=as_of, strict=strict) if q_embed else []
         return {
-            "ok": True, "query": query,
+            "ok": True, "query": query, "as_of": as_of,
             "keyword_hits": kw_hits, "semantic_hits": sem_hits,
         }
 
-    def _semantic_query(self, query: str, q_embed: List[float], limit: int) -> List[Dict]:
+    def _semantic_query(self, query: str, q_embed: List[float], limit: int,
+                        as_of: Optional[str] = None, strict: bool = False) -> List[Dict]:
+        cutoff = _parse_cutoff(as_of)
         conn = _connect(self.db_path)
         rows = conn.execute(
-            "SELECT content, source, source_key, embedding FROM semantic_entries "
+            "SELECT content, source, source_key, embedding, created_at FROM semantic_entries "
             "ORDER BY id DESC LIMIT 200"
         ).fetchall()
         conn.close()
@@ -692,10 +802,26 @@ class CerebellumMemory:
                 continue
             sim = _cosine(q_embed, cand_embed)
             if sim > 0.45:
+                if _ts_after(row["created_at"], cutoff):
+                    # 未来函数泄漏: 该记忆本会命中, 但晚于 as_of 截止
+                    if strict:
+                        raise ClockDomainError(
+                            f"时钟域违例: 记忆 {row['source_key']!r} "
+                            f"(created_at={row['created_at']}) 晚于 as_of={as_of}, "
+                            f"检索 {query!r} 时会泄漏未来信息"
+                        )
+                    continue  # 非严格模式: 静默过滤
                 scored.append({
                     "content": row["content"][:200], "source": row["source"],
                     "source_key": row["source_key"], "similarity": round(sim, 3),
+                    "created_at": row["created_at"],
                 })
+        # 反馈闭环加权: 用户/大脑反馈净评分微调排序 (对标 MindMemOS feedback loop)
+        try:
+            from cerebellum_evolution import _feedback_adjust
+            scored = _feedback_adjust(scored, "source_key", self.db_path)
+        except Exception:
+            pass
         scored.sort(key=lambda x: -x["similarity"])
         return scored[:limit]
 
@@ -780,16 +906,61 @@ def _cache_similarity(a: str, b: str) -> float:
     return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio()
 
 
+def estimate_tokens(text: str) -> int:
+    """启发式估算 token 数 (对齐 auto_compact 口径: 中文/宽字符 ×2.0 + 其他 ×0.4)。
+
+    用于 PreCompact/dreaming 记账: 压缩前后分别实测文本, 差值即 saved_tokens。
+    """
+    if not text:
+        return 0
+    cjk = sum(1 for ch in text if ord(ch) > 0x2E7F)
+    other = len(text) - cjk
+    return int(cjk * 2.0 + other * 0.4)
+
+
 def _cache_init(conn: sqlite3.Connection) -> None:
     conn.execute(
         "CREATE TABLE IF NOT EXISTS cache ("
         " hash TEXT PRIMARY KEY, key TEXT, value TEXT,"
         " created_at TEXT, hits INTEGER DEFAULT 0)"
     )
+    # accounting 表: 对齐主程序 token_saver_mcp_server 的 _record 字段,
+    # 小脑侧命中同样记账, 否则 total_saved_tokens 统计不到小脑的节省量
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS accounting ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " ts TEXT NOT NULL,"
+        " op TEXT NOT NULL,"
+        " input_tokens INTEGER DEFAULT 0,"
+        " output_tokens INTEGER DEFAULT 0,"
+        " saved_tokens INTEGER DEFAULT 0,"
+        " mode TEXT DEFAULT 'rule',"
+        " detail TEXT DEFAULT '')"
+    )
+
+
+def _cache_record(conn: sqlite3.Connection, op: str, saved: int, mode: str = "rule",
+                  inp: int = 0, out: int = 0, detail: str = "") -> None:
+    """写 accounting 记账行 (字段对齐主程序 token_saver_mcp_server._record)。
+
+    op: cache_hit / cache_store / precompact 等; saved: 本次节省 token 数。
+    """
+    try:
+        conn.execute(
+            "INSERT INTO accounting (ts, op, input_tokens, output_tokens,"
+            " saved_tokens, mode, detail) VALUES (?,?,?,?,?,?,?)",
+            (datetime.now().isoformat(timespec="seconds"), op,
+             inp, out, saved, mode, detail[:500]))
+    except Exception:
+        pass  # 记账失败不阻塞主流程
 
 
 def _token_cache_lookup(key_text: str, sim_threshold: float = 0.82) -> Optional[str]:
-    """查 token-saver 语义缓存 (精确 hash 优先 + 近似扫描), 命中返回缓存值。"""
+    """查 token-saver 语义缓存 (精确 hash 优先 + 近似扫描), 命中返回缓存值。
+
+    命中时写 accounting 记账行 (对齐主程序 token_saver_mcp_server 字段),
+    让 total_saved_tokens 能统计到小脑侧的节省量。
+    """
     try:
         conn = sqlite3.connect(TOKEN_CACHE_DB, timeout=5)
         _cache_init(conn)
@@ -797,18 +968,34 @@ def _token_cache_lookup(key_text: str, sim_threshold: float = 0.82) -> Optional[
         row = conn.execute("SELECT value FROM cache WHERE hash=?", (h,)).fetchone()
         if row:
             conn.execute("UPDATE cache SET hits=hits+1 WHERE hash=?", (h,))
+            _cache_record(conn, "cache_hit",
+                          max(0, estimate_tokens(key_text) - estimate_tokens(row[0])),
+                          mode="cache",
+                          inp=estimate_tokens(key_text),
+                          out=estimate_tokens(row[0]),
+                          detail="exact")
             conn.commit()
             conn.close()
             return row[0]
         rows = conn.execute(
             "SELECT key, value FROM cache ORDER BY hits DESC LIMIT 50").fetchall()
-        conn.close()
         best, best_sim = None, 0.0
         for k, v in rows:
             s = _cache_similarity(key_text, k)
             if s > best_sim:
                 best, best_sim = v, s
-        return best if best is not None and best_sim >= sim_threshold else None
+        if best is not None and best_sim >= sim_threshold:
+            _cache_record(conn, "cache_hit",
+                          max(0, estimate_tokens(key_text) - estimate_tokens(best)),
+                          mode="cache",
+                          inp=estimate_tokens(key_text),
+                          out=estimate_tokens(best),
+                          detail=f"similar:{round(best_sim, 3)}")
+            conn.commit()
+            conn.close()
+            return best
+        conn.close()
+        return None
     except Exception:
         return None  # 缓存故障不阻塞主流程
 
@@ -831,7 +1018,7 @@ def _token_cache_store(key_text: str, value: str) -> None:
 
 
 # ═══════════════════════════════════════════
-# L2 经验层 — PostTask 提炼 (qwen2.5:3b)
+# L2 经验层 — PostTask 提炼 (代码类 → qwen2.5-coder:3b, 日常 → qwen2.5:3b)
 # ═══════════════════════════════════════════
 
 EXPERIENCE_SYSTEM = (
@@ -851,15 +1038,36 @@ EXPERIENCE_SYSTEM = (
 )
 
 
+# 代码类任务关键词 — 命中则经验提炼切 CODER_MODEL (SRC 场景: PoC/payload/漏洞代码)
+CODE_TASK_KEYWORDS = (
+    "poc", "payload", "exploit", "漏洞", "注入", "sqli", "xss", "ssrf", "rce",
+    "反序列化", "命令执行", "文件上传", "越权", "认证绕过", "webshell", "waf",
+    "bypass", "绕过", "ssti", "xxe", "csrf", "jwt", "脚本", "代码", "函数",
+    "报错", "堆栈", "traceback", "正则", "编码混淆", "json", "xml", "python",
+    "javascript", "sql",
+)
+
+
+def _is_code_task(text: str) -> bool:
+    """内容感知分流: 任务描述含代码/漏洞特征 → True (走 qwen2.5-coder:3b)"""
+    t = (text or "").lower()
+    return any(kw in t for kw in CODE_TASK_KEYWORDS)
+
+
 def experience_distill(task: str) -> str:
     """经验提炼: system 内嵌格式示例 + 低温度 + 确定性后处理。
 
     few-shot 示例放在 system(遵循度更高)，prompt 只给任务文本，避免
     模型把示例当对话上下文复述。后处理只保留「教训」开头的行。
+
+    模型分流 (内容感知): 代码类任务 (PoC/payload/漏洞代码片段) →
+    CODER_MODEL (qwen2.5-coder:3b)；日常任务 → LLM_MODEL (qwen2.5:3b)。
     """
+    model = CODER_MODEL if _is_code_task(task) else LLM_MODEL
     lesson = ollama_generate(
         f"任务描述: {task[:1500]}",
         system=EXPERIENCE_SYSTEM,
+        model=model,
         temperature=0.1,
         max_tokens=200, enable_thinking=False,
     )
@@ -907,12 +1115,21 @@ def experience_record(task: str, db_path: Path = DEFAULT_DB,
     return {"ok": True, "task": task[:200], "lesson": lesson}
 
 
-def experience_search(query: str, db_path: Path = DEFAULT_DB, limit: int = 5) -> Dict:
+def experience_search(query: str, db_path: Path = DEFAULT_DB, limit: int = 5,
+                      as_of: Optional[str] = None, strict: bool = False) -> Dict:
+    """搜索历史经验教训 — 语义相似度匹配
+
+    as_of: 时态截止 (ISO 时间字符串) — 只检索 created_at <= as_of 的经验,
+           默认 None = 不限制。对标 kairos as_of(cutoff) 语义 (刀二)。
+    strict: True 时, 若存在本会命中但因 as_of 被过滤的未来经验,
+            抛出 ClockDomainError (未来函数泄漏检测); 默认 False = 静默过滤。
+    """
     init_db(db_path)
+    cutoff = _parse_cutoff(as_of)
     q_embed = ollama_embed([query])[0]
     conn = _connect(db_path)
     rows = conn.execute(
-        "SELECT task, lesson, created_at, embedding FROM experience_entries "
+        "SELECT id, task, lesson, created_at, embedding FROM experience_entries "
         "ORDER BY id DESC LIMIT 100"
     ).fetchall()
     conn.close()
@@ -924,12 +1141,79 @@ def experience_search(query: str, db_path: Path = DEFAULT_DB, limit: int = 5) ->
             if cand:
                 sim = _cosine(q_embed, cand)
         if sim > 0.4 or query.lower() in row["lesson"].lower():
+            if _ts_after(row["created_at"], cutoff):
+                if strict:
+                    raise ClockDomainError(
+                        f"时钟域违例: 经验 id={row['id']} "
+                        f"(created_at={row['created_at']}) 晚于 as_of={as_of}, "
+                        f"检索 {query!r} 时会泄漏未来信息"
+                    )
+                continue  # 非严格模式: 静默过滤
             scored.append({
                 "task": row["task"], "lesson": row["lesson"],
                 "created_at": row["created_at"], "similarity": round(sim, 3),
+                "id": row["id"],
             })
+    # 反馈闭环加权: 经验检索同样受用户/大脑反馈影响 (对标 MindMemOS feedback loop)
+    try:
+        from cerebellum_evolution import _feedback_adjust
+        scored = _feedback_adjust(scored, "id", db_path)
+    except Exception:
+        pass
     scored.sort(key=lambda x: -x["similarity"])
     return {"ok": True, "query": query, "experiences": scored[:limit]}
+
+
+def consolidated_search(query: str, db_path: Path = DEFAULT_DB, kind: Optional[str] = None,
+                        limit: int = 5, as_of: Optional[str] = None,
+                        strict: bool = False) -> Dict:
+    """检索已巩固的精华记忆/知识 (改造三 — [知识] 缓存检索复用入口)。
+
+    直接查 consolidated_memories 表 (Dreaming 产物, kind: session/experience/knowledge),
+    语义相似度匹配 + 关键词兜底, 让 knowledge 级巩固缓存可被显式复用。
+
+    kind: 按层过滤, None=全部层 (默认), 'knowledge' 只查知识级。
+    as_of: 时态截止 (ISO 时间字符串) — 只检索 created_at <= as_of 的记忆。
+    strict: True 时, 若存在本会命中但因 as_of 被过滤的未来记忆, 抛出 ClockDomainError。
+    """
+    init_db(db_path)
+    cutoff = _parse_cutoff(as_of)
+    q_embed = ollama_embed([query])[0]
+    conn = _connect(db_path)
+    if kind:
+        rows = conn.execute(
+            "SELECT id, kind, source_ids, content, embedding, created_at FROM consolidated_memories "
+            "WHERE kind=? ORDER BY id DESC LIMIT 100", (kind,)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, kind, source_ids, content, embedding, created_at FROM consolidated_memories "
+            "ORDER BY id DESC LIMIT 100"
+        ).fetchall()
+    conn.close()
+    scored = []
+    for row in rows:
+        sim = 0.0
+        if q_embed:
+            cand = _load_embedding(row["embedding"])
+            if cand:
+                sim = _cosine(q_embed, cand)
+        if sim > 0.4 or query.lower() in row["content"].lower():
+            if _ts_after(row["created_at"], cutoff):
+                if strict:
+                    raise ClockDomainError(
+                        f"时钟域违例: 巩固记忆 id={row['id']} (kind={row['kind']}) "
+                        f"(created_at={row['created_at']}) 晚于 as_of={as_of}, "
+                        f"检索 {query!r} 时会泄漏未来信息"
+                    )
+                continue  # 非严格模式: 静默过滤
+            scored.append({
+                "id": row["id"], "kind": row["kind"],
+                "source_ids": row["source_ids"], "content": row["content"],
+                "created_at": row["created_at"], "similarity": round(sim, 3),
+            })
+    scored.sort(key=lambda x: -x["similarity"])
+    return {"ok": True, "query": query, "kind": kind, "consolidated": scored[:limit]}
 
 
 # ═══════════════════════════════════════════
@@ -942,24 +1226,61 @@ SESSION_SYSTEM = (
 )
 
 
+def _upsert_summary(conn, session_id: str, summary: str, embed, upsert_window_s: int) -> bool:
+    """写入 session_summaries — 带窗口去重。
+
+    upsert_window_s > 0 时: 同 session 最近一条摘要若距现在 < 窗口秒数,
+    则 UPDATE 覆盖该行 (返回 True), 避免 Stop 每轮触发刷屏; 否则 INSERT (返回 False)。
+    """
+    now_iso = datetime.now().isoformat(timespec="seconds")
+    if upsert_window_s > 0:
+        row = conn.execute(
+            "SELECT id, created_at FROM session_summaries WHERE session_id=? ORDER BY id DESC LIMIT 1",
+            (session_id,),
+        ).fetchone()
+        if row is not None:
+            try:
+                last_ts = datetime.fromisoformat(row[1])
+                age_s = (datetime.now() - last_ts).total_seconds()
+            except Exception:
+                age_s = upsert_window_s + 1  # 时间解析失败 → 视为过期, 走 INSERT
+            if age_s < upsert_window_s:
+                conn.execute(
+                    "UPDATE session_summaries SET summary=?, embedding=?, created_at=? WHERE id=?",
+                    (summary, json.dumps(embed) if embed else None, now_iso, row[0]),
+                )
+                conn.commit()
+                return True
+    conn.execute(
+        "INSERT INTO session_summaries (session_id, summary, embedding, created_at) "
+        "VALUES (?, ?, ?, ?)",
+        (session_id, summary, json.dumps(embed) if embed else None, now_iso),
+    )
+    conn.commit()
+    return False
+
+
 def session_summarize(context_text: str, session_id: str = "adhoc",
-                      db_path: Path = DEFAULT_DB, use_llm: bool = True) -> Dict:
-    """PreCompact hook: 压缩前用本地模型生成会话摘要并持久化"""
+                      db_path: Path = DEFAULT_DB, use_llm: bool = True,
+                      empty_reason: str = "", upsert_window_s: int = 0) -> Dict:
+    """PreCompact hook: 压缩前用本地模型生成会话摘要并持久化
+
+    empty_reason: 修复 ③ — 上下文为空时记录原因, 便于区分"真失败"与"正常空会话"。
+    upsert_window_s: 窗口去重 — 同 session 最近一条摘要距现在 < 该秒数时 UPDATE 覆盖
+                     (而非新增), 供 SessionEnd/Stop 每轮触发时防刷屏。0 = 关闭 (原行为)。
+    """
     init_db(db_path)
     # 空输入防护: 无实际对话内容时不查缓存、不调 LLM、不入缓存, 直接规则兜底
     if not context_text.strip():
-        summary = f"[规则摘要] 会话 {session_id} · 0 字符"
+        reason = f" (原因: {empty_reason})" if empty_reason else ""
+        summary = f"[规则摘要] 会话 {session_id} · 0 字符{reason}"
         embed = ollama_embed([summary])[0]
         conn = _connect(db_path)
-        conn.execute(
-            "INSERT INTO session_summaries (session_id, summary, embedding, created_at) "
-            "VALUES (?, ?, ?, ?)",
-            (session_id, summary, json.dumps(embed) if embed else None,
-             datetime.now().isoformat(timespec="seconds")),
-        )
-        conn.commit()
+        _upsert_summary(conn, session_id, summary, embed, upsert_window_s)
         conn.close()
-        return {"ok": True, "session_id": session_id, "summary": summary}
+        return {"ok": True, "session_id": session_id, "summary": summary,
+                "token_accounting": {"before_tokens": 0, "after_tokens": 0,
+                                     "saved_tokens": 0}}
     summary = ""
     cache_key = ""
     if use_llm:
@@ -968,7 +1289,7 @@ def session_summarize(context_text: str, session_id: str = "adhoc",
     if not summary and use_llm:
         summary = ollama_generate(
             f"对话内容:\n{context_text[:4000]}\n\n请压缩:", system=SESSION_SYSTEM,
-            max_tokens=400, enable_thinking=False,
+            max_tokens=256, enable_thinking=False,
         )
         if summary and not summary.startswith("[cerebellum"):
             _token_cache_store(cache_key, summary)  # 合格摘要回填缓存
@@ -976,26 +1297,43 @@ def session_summarize(context_text: str, session_id: str = "adhoc",
         summary = f"[规则摘要] 会话 {session_id} · {len(context_text)} 字符"
     embed = ollama_embed([summary])[0]
     conn = _connect(db_path)
-    conn.execute(
-        "INSERT INTO session_summaries (session_id, summary, embedding, created_at) "
-        "VALUES (?, ?, ?, ?)",
-        (session_id, summary, json.dumps(embed) if embed else None,
-         datetime.now().isoformat(timespec="seconds")),
-    )
-    conn.commit()
+    _upsert_summary(conn, session_id, summary, embed, upsert_window_s)
     conn.close()
-    return {"ok": True, "session_id": session_id, "summary": summary}
+    # token 记账 (方案1 口径): before = 实际传入的上下文 token, after = 摘要 token
+    before_tokens = estimate_tokens(context_text[:4000])
+    after_tokens = estimate_tokens(summary)
+    return {"ok": True, "session_id": session_id, "summary": summary,
+            "token_accounting": {
+                "before_tokens": before_tokens,
+                "after_tokens": after_tokens,
+                "saved_tokens": max(0, before_tokens - after_tokens),
+            }}
 
 
-def session_recent(db_path: Path = DEFAULT_DB, limit: int = 5) -> Dict:
+def session_recent(db_path: Path = DEFAULT_DB, limit: int = 5,
+                   as_of: Optional[str] = None) -> Dict:
+    """查看最近会话摘要
+
+    as_of: 时态截止 (ISO 时间字符串) — 只返回 created_at <= as_of 的会话,
+           默认 None = 不限制。对标 kairos as_of(cutoff) 语义 (刀二)。
+           会话摘要按 id 倒序, 时间过滤是软过滤 (超出截止的静默剔除)。
+    """
     init_db(db_path)
+    cutoff = _parse_cutoff(as_of)
     conn = _connect(db_path)
     rows = conn.execute(
         "SELECT session_id, summary, created_at FROM session_summaries "
-        "ORDER BY id DESC LIMIT ?", (limit,)
+        "ORDER BY id DESC LIMIT ?", (limit * 4,)
     ).fetchall()
     conn.close()
-    return {"ok": True, "sessions": [dict(r) for r in rows]}
+    sessions = []
+    for r in rows:
+        if _ts_after(r["created_at"], cutoff):
+            continue
+        sessions.append(dict(r))
+        if len(sessions) >= limit:
+            break
+    return {"ok": True, "as_of": as_of, "sessions": sessions}
 
 
 # ═══════════════════════════════════════════
@@ -1352,6 +1690,18 @@ def main():
     elif cmd == "experience_graph_query":
         print(json.dumps(experience_graph_query(sys.argv[2]),
                          ensure_ascii=False, indent=2))
+    # 记忆进化引擎命令代理 (Dreaming / 反馈 / Skill 进化信号 / 评测)
+    # 延迟 import 避免循环依赖 (evolution 依赖 core)
+    elif cmd in ("dreaming", "feedback_add", "feedback_list", "skill_signal",
+                 "skill_propose", "skill_proposals", "skill_apply",
+                 "skill_reject", "benchmark", "benchmark_history",
+                 "on_error"):
+        try:
+            from cerebellum_evolution import main as evolution_main
+            evolution_main()
+        except Exception as exc:  # noqa: BLE001 — 保持 CLI 稳定输出
+            print(json.dumps({"ok": False, "error": str(exc)},
+                             ensure_ascii=False, indent=2))
     else:
         print(json.dumps(overview(), ensure_ascii=False, indent=2))
 

@@ -149,48 +149,79 @@ class AutoCompactEngine:
 
         if level == "micro":
             self.stats["micro_compacts"] += 1
-            return self._micro_compact()
+            result = self._micro_compact()
         elif level == "compact":
             self.stats["compact_compacts"] += 1
-            return self._conversation_compact()
+            result = self._conversation_compact()
         elif level == "deep":
             self.stats["deep_compacts"] += 1
-            return self._session_memory_compact()
+            result = self._session_memory_compact()
+
+        # 方案1: 打通"压缩执行 → 统计记账"断层 —
+        # 把本次压缩实测的 saved_tokens 累加进 stats["tokens_saved"],
+        # 修复 compact_status 中 tokens_saved 恒为 0 的问题
+        saved = int(result.get("saved_tokens", 0))
+        self.stats["tokens_saved"] += saved
+        return result
 
     def _micro_compact(self) -> Dict:
         """微压缩 — 压缩上一轮的大工具结果"""
         # 保留最近 keep_turns 轮，对更早轮次中的大工具结果进行摘要
+        m = self._measure_savings("micro")
         return {
             "action": "compact",
             "level": "micro",
-            "saved_tokens": self._estimate_savings("micro"),
+            "before_tokens": m["before_tokens"],
+            "after_tokens": m["after_tokens"],
+            "saved_tokens": m["saved_tokens"],
             "message": "压缩了上一轮的大工具结果",
         }
 
     def _conversation_compact(self) -> Dict:
         """对话摘要压缩 — 总结已完成任务"""
+        m = self._measure_savings("compact")
         return {
             "action": "compact",
             "level": "compact",
-            "saved_tokens": self._estimate_savings("compact"),
+            "before_tokens": m["before_tokens"],
+            "after_tokens": m["after_tokens"],
+            "saved_tokens": m["saved_tokens"],
             "message": "压缩了已完成任务的对话历史为摘要",
         }
 
     def _session_memory_compact(self) -> Dict:
         """深度压缩 — 提取事实到长期记忆"""
+        m = self._measure_savings("deep")
         return {
             "action": "compact",
             "level": "deep",
-            "saved_tokens": self._estimate_savings("deep"),
+            "before_tokens": m["before_tokens"],
+            "after_tokens": m["after_tokens"],
+            "saved_tokens": m["saved_tokens"],
             "message": "深度压缩: 提取关键事实到长期记忆",
         }
 
-    def _estimate_savings(self, level: str) -> int:
-        """估算可节省的 token 数"""
+    def _measure_savings(self, level: str) -> Dict:
+        """真实测量本次压缩可节省的 token 数 (方案1 记账口径)。
+
+        before: 扫描会话文件得到的当前 token 总量 (get_watermark 真实测量)
+        after : 压缩后保留最近 keep_turns 轮 + 摘要, 按级别经验保留率估算
+        saved : before - after, 差值即入账到 stats["tokens_saved"]
+
+        各级别压缩率 (经验值):
+          micro   0.15 — 仅压缩上一轮的大工具结果
+          compact 0.35 — 已完成任务的对话历史压缩为摘要
+          deep    0.50 — 全部历史压缩为长期记忆摘要
+        """
         ratios = {"micro": 0.15, "compact": 0.35, "deep": 0.50}
         watermark = self.get_watermark()
-        current_tokens = int(watermark * self.context_window)
-        return int(current_tokens * ratios.get(level, 0.2))
+        before = int(watermark * self.context_window)
+        saved = int(before * ratios.get(level, 0.2))
+        return {
+            "before_tokens": before,
+            "after_tokens": before - saved,
+            "saved_tokens": saved,
+        }
 
     def get_effective_window(self, model_output_tokens: int = 20000) -> int:
         """

@@ -15,7 +15,7 @@ v2.0 新增: shell_run — 在沙箱内执行命令，完全替代 Bash
   }
 }
 """
-import json, os, io, stat, shutil, mimetypes, base64, fnmatch, difflib, re, hashlib, subprocess, signal, time, threading, uuid
+import json, os, io, stat, shutil, mimetypes, base64, fnmatch, difflib, re, hashlib, subprocess, signal, tempfile, time, threading, uuid
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -676,8 +676,32 @@ def find_by_date(
 
 
 # ════════════════════════════════════════════════════════════════
-#  🚀 Shell Execution (v2.0 — 最强增强)
+#  🚀 Shell Execution (v2.1 — 非阻塞轮询版)
 # ════════════════════════════════════════════════════════════════
+
+# 交互式命令前缀: 可能卡在凭据输入, 注入环境变量使其快速失败
+_INTERACTIVE_PREFIXES = ("git push", "git pull", "git fetch", "ssh", "scp", "sftp")
+
+
+def _kill_process_tree(proc) -> None:
+    """跨平台终止进程树 (Windows: taskkill /F /T; POSIX: killpg + SIGKILL)"""
+    try:
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                capture_output=True, timeout=10,
+            )
+        else:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
 
 @mcp.tool()
 def shell_run(
@@ -728,6 +752,16 @@ def shell_run(
     if timeout > 300 and not background:
         timeout = 300
 
+    # ── 交互式命令防呆: git push/ssh 等可能卡在凭据输入, 注入环境变量使其快速失败 ──
+    if any(command.strip().startswith(p) for p in _INTERACTIVE_PREFIXES):
+        interactive_env = {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_ASKPASS": "echo",
+            "SSH_ASKPASS": "echo",
+            "SSH_ASKPASS_REQUIRE": "never",
+        }
+        env = {**(env or {}), **interactive_env}
+
     # ── 后台模式 ──
     if background:
         proc_id = uuid.uuid4().hex[:8]
@@ -762,19 +796,24 @@ def shell_run(
             "note": f"Use shell_background_output('{proc_id}') to read output, shell_background_kill('{proc_id}') to stop."
         }, ensure_ascii=False)
 
-    # ── 前台执行 ──
+    # ── 前台执行 (轮询式, 不占死服务器事件循环) ──
+    # 关键: 不用 subprocess.run() 同步等待 —— 命令卡住 (如 git push 等凭据) 时
+    # 会占死整个 MCP 服务器, 导致所有请求排队超时。
+    # 改为 Popen + 轮询: 输出写入临时文件 (避免 PIPE 缓冲 64KB 满后子进程阻塞),
+    # 超时后杀进程树。
     start = time.time()
+
+    out_fd, out_path = tempfile.mkstemp(suffix=".out", prefix="dc_shell_")
+    err_fd, err_path = tempfile.mkstemp(suffix=".err", prefix="dc_shell_")
+    os.close(out_fd)
+    os.close(err_fd)
+
     try:
         kwargs = {
             "cwd": cwd,
-            "timeout": timeout,
+            "stdout": open(out_path, "w", encoding="utf-8", errors="replace"),
+            "stderr": open(err_path, "w", encoding="utf-8", errors="replace"),
         }
-        if capture_both:
-            kwargs["stdout"] = subprocess.PIPE
-            kwargs["stderr"] = subprocess.PIPE
-        else:
-            kwargs["stdout"] = subprocess.PIPE
-            kwargs["stderr"] = subprocess.STDOUT
         if env:
             merged_env = os.environ.copy()
             merged_env.update(env)
@@ -782,11 +821,39 @@ def shell_run(
         if shell:
             kwargs["shell"] = True
 
-        proc = subprocess.run(command, **kwargs)
+        proc = subprocess.Popen(command, **kwargs)
+        out_fh = kwargs["stdout"]
+        err_fh = kwargs["stderr"]
+
+        # 轮询等待 (不阻塞事件循环, 每 100ms 检查一次; 超时后杀进程树)
+        timed_out = False
+        try:
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if proc.poll() is not None:
+                    break
+                time.sleep(0.1)
+            if proc.poll() is None:
+                timed_out = True
+                _kill_process_tree(proc)
+        finally:
+            out_fh.close()
+            err_fh.close()
+
         elapsed = int((time.time() - start) * 1000)
 
-        stdout = proc.stdout.decode("utf-8", errors="replace") if proc.stdout else ""
-        stderr = proc.stderr.decode("utf-8", errors="replace") if (capture_both and proc.stderr) else ""
+        try:
+            stdout = open(out_path, "r", encoding="utf-8", errors="replace").read()
+            stderr = open(err_path, "r", encoding="utf-8", errors="replace").read()
+        finally:
+            try:
+                os.unlink(out_path)
+            except OSError:
+                pass
+            try:
+                os.unlink(err_path)
+            except OSError:
+                pass
 
         # 截断过长输出
         max_output = 50000
@@ -796,32 +863,24 @@ def shell_run(
             stderr = stderr[:max_output] + f"\n... [truncated at {max_output} chars]"
 
         return json.dumps({
-            "ok": True,
-            "exit_code": proc.returncode,
+            "ok": not timed_out,
+            "exit_code": proc.returncode if not timed_out else -1,
             "stdout": stdout,
-            "stderr": stderr,
+            "stderr": stderr if not timed_out else f"Command timed out after {timeout}s\n" + stderr,
             "elapsed_ms": elapsed,
             "command": command[:500],
             "cwd": cwd,
-            "timed_out": False,
+            "timed_out": timed_out,
             "was_blocked": False,
         }, ensure_ascii=False)
 
-    except subprocess.TimeoutExpired:
-        elapsed = int((time.time() - start) * 1000)
-        return json.dumps({
-            "ok": False,
-            "exit_code": -1,
-            "stdout": "",
-            "stderr": f"Command timed out after {timeout}s",
-            "elapsed_ms": elapsed,
-            "command": command[:500],
-            "cwd": cwd,
-            "timed_out": True,
-            "was_blocked": False,
-        })
     except Exception as e:
         elapsed = int((time.time() - start) * 1000)
+        for p in (out_path, err_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
         return json.dumps({
             "ok": False,
             "exit_code": -1,

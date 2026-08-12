@@ -30,6 +30,7 @@ import time
 import hashlib
 import sqlite3
 import sys
+import urllib.request
 from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
 
@@ -38,7 +39,12 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-import httpx
+from pathlib import Path
+
+# 共享 Ollama 接入层 (core/ollama_client.py) — 统一小脑/router_cascade/token_saver/ollama-mcp 的 HTTP 调用
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))  # F:/DEEPCODE
+from core.ollama_client import chat as _oc_chat
+from core.ollama_client import status as _oc_status
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("token-saver-mcp")
@@ -270,18 +276,14 @@ class LLMBackend:
         self.host = host.rstrip("/")
         self.model = model
         self.backend_ok: Optional[bool] = None
-        self._client = httpx.Client(base_url=self.host, timeout=10.0)
 
     def ping(self) -> bool:
-        try:
-            r = self._client.get("/api/tags", timeout=3.0)
-            if r.status_code == 200:
-                models = [m.get("name", "") for m in r.json().get("models", [])]
-                self.backend_ok = True
-                self.models = models
-                return True
-        except Exception:
-            pass
+        """健康检查 (统一走共享 core/ollama_client.py)"""
+        info = _oc_status(self.host)
+        if info.get("ok"):
+            self.backend_ok = True
+            self.models = info.get("models", [])
+            return True
         self.backend_ok = False
         self.models = []
         return False
@@ -296,37 +298,29 @@ class LLMBackend:
 
     def chat(self, system: str, user: str, max_tokens: int = MAX_SUMMARY_TOKENS,
              timeout: float = 180.0) -> Optional[Dict[str, Any]]:
-        """调用本地模型。返回 {text, prompt_tokens, output_tokens} 或 None。"""
+        """调用本地模型 (统一走共享 core/ollama_client.py)。
+        返回 {text, prompt_tokens, output_tokens} 或 None。
+        """
         if not self.model_ready():
             return None
         try:
-            payload = {
-                "model": self.model,
-                "messages": [
+            data = _oc_chat(
+                self.host, self.model,
+                [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                "stream": False,
-                "options": {
-                    "num_predict": max_tokens,
-                    "temperature": 0.2,
-                    "top_p": 0.9,
-                },
-                "keep_alive": "30m",
+                temperature=0.2, max_tokens=max_tokens,
+                timeout=int(timeout), keep_alive="30m",
+            )
+            msg = data.get("message", {}).get("content", "").strip()
+            if not msg:
+                return None
+            return {
+                "text": msg,
+                "prompt_tokens": data.get("prompt_eval_count", estimate_tokens(system + user)),
+                "output_tokens": data.get("eval_count", estimate_tokens(msg)),
             }
-            with httpx.Client(base_url=self.host, timeout=timeout) as c:
-                r = c.post("/api/chat", json=payload)
-                if r.status_code != 200:
-                    return None
-                data = r.json()
-                msg = data.get("message", {}).get("content", "").strip()
-                if not msg:
-                    return None
-                return {
-                    "text": msg,
-                    "prompt_tokens": data.get("prompt_eval_count", estimate_tokens(system + user)),
-                    "output_tokens": data.get("eval_count", estimate_tokens(msg)),
-                }
         except Exception:
             return None
 
@@ -369,11 +363,14 @@ class DeepSeekBackend:
                 "temperature": 0.2,
                 "stream": False,
             }
-            r = requests.post(f"{self.base_url}/chat/completions",
-                              headers=headers, json=payload, timeout=timeout)
-            if r.status_code != 200:
-                return None
-            data = r.json()
+            req = urllib.request.Request(
+                f"{self.base_url.rstrip('/')}/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
             msg = data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
             if not msg:
                 return None

@@ -26,6 +26,12 @@ import httpx
 import pandas as pd
 from mcp.server.fastmcp import FastMCP
 
+# 本地小脑级联 + 语义缓存（自包含模块，缺失/出错时自动降级为纯路由模式）
+try:
+    import router_cascade as cascade
+except Exception:  # noqa: BLE001 — 任何异常都不影响主服务
+    cascade = None
+
 mcp = FastMCP("router-mcp")
 
 # ════════════════════════════════════════════════════════════════
@@ -38,10 +44,11 @@ if not API_KEY:
     raise RuntimeError("DEEPSEEK_API_KEY 未设置。请创建 .env 文件并添加 DEEPSEEK_API_KEY=your_key")
 
 # 成本表（¥/百万 tokens）— 与 deepseek-direct 合并后统一口径
+# cache_hit 为 DeepSeek 前缀缓存命中价（逆向恢复官方 CNY 牌价，v4-flash 1:50:100、v4-pro 1:120:240）
 MODEL_COSTS = {
-    "deepseek-v4-flash": {"in": 1,  "out": 2,  "emoji": "⚡", "label": "V4 Flash", "note": ""},
-    "deepseek-v4-pro":   {"in": 12, "out": 24, "emoji": "🧠", "label": "V4 Pro",   "note": "（促销折扣后约 ¥3/¥6）"},
-    "deepseek-r1":       {"in": 4,  "out": 16, "emoji": "🔴", "label": "R1 推理",  "note": "（推荐用 V4 Pro 替代）"},
+    "deepseek-v4-flash": {"in": 1,  "out": 2,  "cache_hit": 0.02,  "emoji": "⚡", "label": "V4 Flash", "note": "官方牌价 ¥1/¥2，缓存命中 ¥0.02"},
+    "deepseek-v4-pro":   {"in": 3,  "out": 6,  "cache_hit": 0.025, "emoji": "🧠", "label": "V4 Pro",   "note": "官方牌价 ¥3/¥6，缓存命中 ¥0.025"},
+    "deepseek-r1":       {"in": 4,  "out": 16, "emoji": "🔴", "label": "R1 推理",  "note": "（推荐用 V4 Pro 替代，缓存价未确认按 1/10 近似）"},
 }
 
 # 模型 ID 映射（API 实际使用的模型名）
@@ -56,6 +63,8 @@ _stats = {
     "total_queries": 0,
     "routes": {"simple": 0, "complex": 0, "chan_theory": 0, "data_query": 0},
     "total_cost_yuan": 0.0,
+    "prompt_cache_hit_tokens": 0,    # DeepSeek 前缀缓存命中 tokens（免费羊毛）
+    "prompt_cache_miss_tokens": 0,   # 前缀缓存未命中 tokens
     "last_query": None,
 }
 
@@ -613,11 +622,14 @@ async def call_deepseek(
         content = msg.get("content") or reasoning or "(empty)"
         usage = data.get("usage", {})
 
-        # 计算成本
+        # 计算成本（DeepSeek 前缀缓存命中部分按 cache_hit 价计费，未命中按 in 价）
         costs = MODEL_COSTS.get(model_key, {"in": 1, "out": 2})
         prompt_tokens = usage.get("prompt_tokens", 0)
         completion_tokens = usage.get("completion_tokens", 0)
-        cost = (prompt_tokens * costs["in"] + completion_tokens * costs["out"]) / 1_000_000
+        cache_hit = usage.get("prompt_cache_hit_tokens", 0)
+        cache_miss = max(prompt_tokens - cache_hit, 0)
+        cache_price = costs.get("cache_hit", costs["in"] * 0.1)  # 无精确 cache 价的模型按 1/10 近似
+        cost = (cache_miss * costs["in"] + cache_hit * cache_price + completion_tokens * costs["out"]) / 1_000_000
 
         return {
             "content": content,
@@ -625,6 +637,8 @@ async def call_deepseek(
             "model": data.get("model", model_id),
             "usage": usage,
             "cost_yuan": cost,
+            "cache_hit_tokens": cache_hit,
+            "cache_miss_tokens": cache_miss,
             "finish_reason": choice.get("finish_reason", ""),
         }
 
@@ -654,6 +668,13 @@ def format_llm_output(result: dict, route_info: dict) -> str:
     out += f"📊 模型: {result.get('model', '?')}\n"
     out += f"📊 Token: 入{usage.get('prompt_tokens', 0)} + 出{usage.get('completion_tokens', 0)}"
     out += f" = {usage.get('total_tokens', 0)}\n"
+    # DeepSeek 前缀缓存命中信息（免费羊毛：命中部分价格大幅降低）
+    hit_t = result.get("cache_hit_tokens", 0)
+    if hit_t:
+        miss_t = result.get("cache_miss_tokens", 0)
+        total_prompt = hit_t + miss_t
+        hit_rate = hit_t / total_prompt * 100 if total_prompt > 0 else 0.0
+        out += f"⚡ 前缀缓存: 命中 {hit_t} / 未命中 {miss_t} tokens (命中率 {hit_rate:.1f}%)\n"
     out += f"💰 成本: ¥{cost:.4f} {note}\n"
     out += f"🎯 路由: {emoji} {route_info['route']}"
 
@@ -677,8 +698,8 @@ async def router_query(
 
     根据输入内容自动判断:
     - 简单问答 → V4 Flash (¥1)    ⚡
-    - 复杂分析 → V4 Pro   (¥12)   🧠
-    - 缠论推演 → V4 Pro   (¥12)   📐
+    - 复杂分析 → V4 Pro   (¥3)    🧠
+    - 缠论推演 → V4 Pro   (¥3)    📐
     - 日常数据 → 本地计算 (¥0)    💻
     - 深度推理 → R1       (¥4)    🔴
 
@@ -724,13 +745,43 @@ async def router_query(
         )
         return header + result
 
+    # ── 语义缓存 + 本地小脑级联（仅自动路由 + simple，force 时跳过）──
+    if cascade and not force_route and not force_model and route_info["route"] == "simple":
+        cached = cascade.cache_lookup(query, route=route_info["route"])
+        if cached:
+            _stats["total_cost_yuan"] += 0.0
+            header = (
+                f"⚡ [语义缓存命中 · 零成本]\n"
+                f"🔄 相似度 {cached['similarity']:.2f} 直接返回历史答案\n\n"
+            )
+            return header + cached["response"]
+
+        local = cascade.cascade_answer(query, temperature=min(temperature, 0.5))
+        if local:
+            _stats["total_cost_yuan"] += 0.0
+            cascade.cache_store(query, local["response"], route=route_info["route"])
+            header = (
+                f"🧠 [本地小脑 · 零成本]\n"
+                f"🔄 qwen3:4b 本地回答通过信任评估 (评分 {local['score']:.2f})\n\n"
+            )
+            return header + local["response"]
+
     # ── LLM 调用 ──
     if max_tokens == 0:
         max_tokens = 8192 if route_info["route"] in ("complex", "chan_theory") else 2048
 
+    # 进云端前的长输入压缩（仅自动路由; 确定性规则, 不破坏 DeepSeek 前缀缓存）
+    # 用独立变量, 不覆盖 query (缓存 key 保持原始用户问题)
+    prompt_to_send = query
+    if cascade and not force_route and not force_model:
+        compressed = cascade.compress_prompt(query)
+        if compressed != query:
+            prompt_to_send = compressed
+            route_info["reason"] = (route_info.get("reason") or "") + " + 输入已压缩"
+
     result = await call_deepseek(
         model_key=route_info["model"],
-        prompt=query,
+        prompt=prompt_to_send,
         system=route_info.get("system_prompt", ""),
         max_tokens=max_tokens,
         temperature=temperature,
@@ -746,6 +797,18 @@ async def router_query(
 
     cost = result.get("cost_yuan", 0)
     _stats["total_cost_yuan"] += cost
+
+    # DeepSeek 前缀缓存统计累计（免费羊毛：命中部分价格大幅降低）
+    _stats["prompt_cache_hit_tokens"] += result.get("cache_hit_tokens", 0)
+    _stats["prompt_cache_miss_tokens"] += result.get("cache_miss_tokens", 0)
+
+    # 云端输出去水 + 写入语义缓存（仅 simple 自动路由；去水失败自动降级返回原文）
+    if cascade and not force_route and not force_model and route_info["route"] == "simple":
+        content = result.get("content", "")
+        dewatered = cascade.dewater_response(content)
+        if dewatered and dewatered != content:
+            result["content"] = dewatered
+        cascade.cache_store(query, result.get("content", ""), route=route_info["route"])
 
     return format_llm_output(result, route_info)
 
@@ -806,12 +869,32 @@ async def router_status() -> str:
     out += "📊 运行统计:\n"
     out += f"  总请求数: {_stats['total_queries']}\n"
     out += f"  总花费:   ¥{_stats['total_cost_yuan']:.4f}\n"
+    hit_tokens = _stats.get("prompt_cache_hit_tokens", 0)
+    miss_tokens = _stats.get("prompt_cache_miss_tokens", 0)
+    total_prompt = hit_tokens + miss_tokens
+    if total_prompt > 0:
+        hit_rate = hit_tokens / total_prompt * 100
+        out += f"  ⚡ DeepSeek 前缀缓存: 命中 {hit_tokens} / 未命中 {miss_tokens} tokens (命中率 {hit_rate:.1f}%)\n"
     for route, count in _stats["routes"].items():
         emoji = {"simple": "⚡", "complex": "🧠", "chan_theory": "📐", "data_query": "💻"}
         out += f"  {emoji.get(route, '❓')} {route}: {count} 次\n"
 
     if _stats["last_query"]:
         out += f"\n  最近查询: \"{_stats['last_query']}\"\n"
+
+    # 级联 + 语义缓存状态（模块缺失时跳过）
+    if cascade is not None:
+        try:
+            cs = cascade.cascade_stats()
+            out += "\n  🧠 本地小脑级联:\n"
+            out += f"    本地回答(信任通过): {cs.get('local_answers', 0)} 次\n"
+            out += f"    升级云端:           {cs.get('local_escalated', 0)} 次\n"
+            out += "  ⚡ 语义缓存 (bge-m3):\n"
+            out += f"    命中: {cs.get('cache_hits', 0)} 次 | 存储: {cs.get('cache_stored', 0)} 条\n"
+        except Exception:  # noqa: BLE001 — 统计异常不影响状态面板
+            out += "\n  🧠 本地小脑级联: 状态读取失败\n"
+    else:
+        out += "\n  🧠 本地小脑级联: 未启用（router_cascade 缺失）\n"
 
     out += "\n" + "─" * 60 + "\n"
     out += "🔧 使用:\n"
@@ -858,6 +941,19 @@ async def router_analyze_breakdown() -> str:
 
     out += f"📊 总查询: {total} 次\n"
     out += f"💰 实际总花费: ¥{total_cost:.4f}\n\n"
+
+    # DeepSeek 前缀缓存省钱估算（命中价 vs 输入价的精确差价，v4-flash 命中 ¥0.02 比输入 ¥1 省 98%）
+    hit_tokens = _stats.get("prompt_cache_hit_tokens", 0)
+    miss_tokens = _stats.get("prompt_cache_miss_tokens", 0)
+    if hit_tokens > 0:
+        total_prompt = hit_tokens + miss_tokens
+        hit_rate = hit_tokens / total_prompt * 100 if total_prompt > 0 else 0.0
+        ref = MODEL_COSTS.get("deepseek-v4-flash", {"in": 1})
+        ref_cache = ref.get("cache_hit", ref["in"] * 0.1)  # 参考模型 V4 Flash 的缓存命中价
+        cache_saved = hit_tokens * (ref["in"] - ref_cache) / 1_000_000  # 精确差价 = 输入价 - 命中价
+        out += "⚡ DeepSeek 前缀缓存:\n"
+        out += f"  命中 {hit_tokens} / 未命中 {miss_tokens} tokens (命中率 {hit_rate:.1f}%)\n"
+        out += f"  缓存省钱 ≈ ¥{cache_saved:.4f}（V4 Flash 精确差价 ¥{ref['in'] - ref_cache}/M）\n\n"
 
     out += "📈 节省对比:\n"
     out += f"  方案               总花费        对比实际\n"
