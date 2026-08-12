@@ -42,7 +42,9 @@ try:
     from ..ollama_client import status as _oc_status
 except ImportError:
     # 兼容以顶层模块导入 (sys.path 含 core/mcp_servers 时), 退化为按 core 包导入
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    # 注意: parent.parent 只到 F:/DEEPCODE/core, 还差一级才能解析 core 包
+    # (修复 2026-08-12: .parent.parent → .parent.parent.parent, 否则 ModuleNotFoundError: core)
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
     from core.ollama_client import embed as _oc_embed
     from core.ollama_client import generate as _oc_generate
     from core.ollama_client import status as _oc_status
