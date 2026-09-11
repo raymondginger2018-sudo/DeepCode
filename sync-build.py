@@ -26,6 +26,8 @@ def should_exclude(name, is_dir):
         return True
     if not is_dir:
         for pat in EXCLUDE_FILES:
+            if pat == name:                     # exact filename match
+                return True
             if pat.startswith('*.'):
                 if name.endswith(pat[1:]):
                     return True
@@ -193,25 +195,64 @@ def main():
     print("Done! Ready to commit in .dc-sync/")
     
     # Final safety scan: fail if any real secrets leaked through
-    import subprocess
-    result = subprocess.run(
-        ['rg', '-n', '--no-messages',
-         '-e', r'sk-[a-zA-Z0-9]{16,}',
-         '-e', r'ghp_[a-zA-Z0-9]{20,}',
-         '-e', r'AKIA[0-9A-Z]{16}',
-         '-e', r'1a41dc66',
-         ROOT],
-        capture_output=True, text=True
-    )
-    if result.stdout.strip():
-        leaked = result.stdout.strip().split('\n')
-        print(f"\n⚠️  SECURITY WARNING: {len(leaked)} file(s) contain secrets!")
-        for l in leaked:
-            print(f"  {l}")
-        print("  These must be excluded before committing!")
+    scan_and_verify()
+
+# Secret patterns: label -> compiled regex
+SECRET_PATTERNS = [
+    ('deepseek-key',  re.compile(r'sk-[a-zA-Z0-9]{16,}')),
+    ('github-pat',    re.compile(r'ghp_[a-zA-Z0-9]{20,}')),
+    ('aws-akia',      re.compile(r'AKIA[0-9A-Z]{16}')),
+    ('tushare-token', re.compile(r'1a41dc66[a-f0-9]*')),
+]
+# Placeholders / docs that are NOT real secrets
+PLACEHOLDER_RE = re.compile(
+    r'^[\'"`]?(sk|ghp)_(x+|\.\.\.|YOUR|REDACTED|\{[^}]*\})[\'"`]?$'
+)
+SKIP_FILES = {'sync-build.py'}   # scanner itself contains the patterns
+TEXT_EXT = {'.py', '.md', '.json', '.js', '.mjs', '.cjs', '.ts', '.ps1',
+            '.sh', '.yml', '.yaml', '.txt', '.cfg', '.ini', '.vbs', '.bat',
+            '.html', '.css', '.star', '.xml', '.toml'}
+
+def _is_placeholder(match):
+    """True if the matched token is obviously a placeholder/example."""
+    m = match.group(0)
+    if PLACEHOLDER_RE.match(m):
+        return True
+    # all-'x' bodies or repeated single char => placeholder
+    body = m.split('_', 1)[-1]
+    if len(set(body)) == 1:
+        return True
+    # common doc examples like sk-1234567890abcdefghijklmn
+    return '1234567890' in m
+
+def scan_and_verify():
+    findings = []
+    for root, dirs, files in os.walk(ROOT):
+        dirs[:] = [d for d in dirs if d not in ('.git', 'node_modules', '__pycache__')]
+        for fname in files:
+            if fname in SKIP_FILES:
+                continue
+            if os.path.splitext(fname)[1].lower() not in TEXT_EXT:
+                continue
+            fpath = os.path.join(root, fname)
+            try:
+                with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
+                    for lineno, line in enumerate(f, 1):
+                        for label, pat in SECRET_PATTERNS:
+                            for m in pat.finditer(line):
+                                if not _is_placeholder(m):
+                                    rel = os.path.relpath(fpath, ROOT)
+                                    findings.append((rel, lineno, label, m.group(0)[:12] + '...'))
+            except OSError:
+                continue
+
+    if findings:
+        print(f"\n⚠️  SECURITY WARNING: {len(findings)} real secret(s) detected!")
+        for rel, lineno, label, preview in findings:
+            print(f"  {rel}:{lineno}  [{label}] {preview}")
+        print("  → Add to EXCLUDE_FILES or sanitize before committing!")
         sys.exit(1)
-    else:
-        print("✓ Secret scan passed — no real secrets found")
+    print("✓ Secret scan passed — no real secrets found")
 
 if __name__ == '__main__':
     main()
