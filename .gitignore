@@ -98,3 +98,37 @@ credentials.json
 .env.*
 !.env.example
 !*.env.example
+
+# === DEEPCODE 本地私有（绝不提交）===
+# 这些目录/文件含真实 API 密钥、运行时数据、本地配置
+.mcp.json
+settings.json
+.deepcode/
+.dsh/
+.claude/
+.dc-sync/
+.agents/
+.claude-flow/
+.deepcode-subagent/
+.deepcode-vdp-run/
+.swarm/
+.playwright-mcp/
+%TEMP%/
+.pr_watch_state.json
+BACKUP/
+backups/
+_archive/
+reports/
+report_data/
+analysis_output/
+cache_data/
+auto_fixes/
+patches/
+data/
+database.db
+database.db-shm
+database.db-wal
+*.db
+*.db-shm
+*.db-wal
+# DEEPCODE 私有 end
