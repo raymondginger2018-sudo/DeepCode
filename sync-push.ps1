@@ -1,4 +1,4 @@
-# sync-push.ps1 — 收集本机改动并推送到 GitHub
+﻿# sync-push.ps1 — 收集本机改动并推送到 GitHub
 # 用法: powershell -ExecutionPolicy Bypass -File .\sync-push.ps1 [-Message "自定义提交信息"]
 #
 # 等价于: python sync-build.py && git add -A && git commit && git push

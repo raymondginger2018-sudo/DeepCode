@@ -1,4 +1,4 @@
-# sync-pull.ps1 — 从 GitHub 拉取最新配置并部署到本机活动位置
+﻿# sync-pull.ps1 — 从 GitHub 拉取最新配置并部署到本机活动位置
 # 用法: powershell -ExecutionPolicy Bypass -File .\sync-pull.ps1
 #
 # 等价于: git pull origin sync/config && sync-deploy.ps1

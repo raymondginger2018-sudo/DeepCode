@@ -1,4 +1,4 @@
-# sync-deploy.ps1 — 将 .dc-sync/ 中的同步内容部署到 DEEPCODE 活动位置
+﻿# sync-deploy.ps1 — 将 .dc-sync/ 中的同步内容部署到 DEEPCODE 活动位置
 # 用法（在 F:\DEEPCODE\.dc-sync 下）:
 #   powershell -ExecutionPolicy Bypass -File .\sync-deploy.ps1 [-DryRun]
 #
