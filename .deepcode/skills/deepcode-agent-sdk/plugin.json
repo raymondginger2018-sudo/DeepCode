@@ -1,0 +1,9 @@
+{
+  "name": "deepcode-agent-sdk",
+  "version": "2.0.0",
+  "description": "DeepCode Agent SDK v2.0 — 让 DeepCode 作为 Agent 被外部程序调用 (HTTP/MCP/Embedded)，支持事件流、多轮循环、权限预算、SQLite 会话持久化",
+  "author": "DeepCode + Ghidra RE (Claude Code v2.1.216)",
+  "entry": "SKILL.md",
+  "dependencies": [],
+  "modules": ["agent_sdk_server.py"]
+}

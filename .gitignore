@@ -1,0 +1,94 @@
+# === sync/config branch .gitignore ===
+# Exclude everything; track only what's explicitly needed
+
+# Secrets — NEVER commit
+*.env*
+deepcode_config.json
+deepcode_config.json.lock
+*.secrets.yaml
+*.secrets.yml
+secrets.json
+credentials.json
+*credentials*.json
+.claude/settings.local.json
+
+# Node / Build
+node_modules/
+dist/
+build/
+
+# Caches / Runtime
+__pycache__/
+*.py[cod]
+.cache/
+*.db
+*.sqlite
+*.sqlite3
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Git / SCM (nested repos inside skills)
+.git/
+
+# Backups
+*.bak*
+
+# Logs
+*.log
+
+# Binary / Large Media
+*.webp
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.ico
+*.woff
+*.woff2
+*.ttf
+*.exe
+*.dll
+
+# IDE
+.idea/
+.vscode/
+
+# === Skill-specific exclusions ===
+
+# harmony-next is a large 100MB+ doc corpus, clone separately from linhay
+# See: https://github.com/linhay/harmony-next.skills.git
+.deepcode/skills/harmony-next/
+.dsh/skills/harmony-next/
+
+# cerebellum.db is 24MB runtime DB — machine-specific
+.deepcode/skills/deepcode-cerebellum/data/
+
+# settings.json.bak* contain real API keys
+# Only the live settings.json is tracked if sanitized
+settings.json
+.deepcode/settings.json
+.deepcode/settings.json.bak*
+.deepcode/rules/github-token.md
+
+# Built binaries / CLI artifacts
+.deepcode/bin/
+.deepcode/cli/
+
+# DSH runtime
+.dsh/core/
+.dsh/hooks/
+.dsh/ui/
+.dsh/cerebellum-scheduler/
+.dsh/agent-team-install-progress.md
+.dsh/merge-agent-team-patch.mjs
+
+# Claude memory (machine-local)
+.claude/memory.db
+
+# Hardcoded secrets — never sync
+github-token.md
+start_pr_watch.vbs
+
+# macOS
+.DS_Store

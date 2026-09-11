@@ -1,0 +1,2 @@
+Adapted from github.com/mattpocock/skills (MIT, Copyright (c) 2026 Matt Pocock).
+Ported 2026-08-16, content unmodified. Original: skills/productivity/writing-for-agents/

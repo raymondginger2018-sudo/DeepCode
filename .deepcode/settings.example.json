@@ -1,0 +1,394 @@
+{
+  "thinkingEnabled": true,
+  "reasoningEffort": "low",
+  "model": "DeepSeek-V4-Flash",
+  "autoCompactWindow": 128000,
+  "env": {
+    "FORK_SUBAGENT": "true",
+    "FORCE_SANDBOX": "false",
+    "BASE_URL": "https://api.scnet.cn/api/llm/v1",
+    "API_KEY": "sk-tp-NDIyLTEyMjE4NjUyNDUzLTE3ODczMTcxMjM3MzI=",
+    "DEEPSEEK_API_KEY": "sk-tp-NDIyLTEyMjE4NjUyNDUzLTE3ODczMTcxMjM3MzI="
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write",
+        "type": "command",
+        "command": "python3 F:/DEEPCODE/scripts/pipelines/pipeline_sandbox_validator.py {file_path}",
+        "timeout": 15
+      },
+      {
+        "matcher": "Edit",
+        "type": "command",
+        "command": "python3 F:/DEEPCODE/scripts/pipelines/pipeline_sandbox_validator.py {file_path}",
+        "timeout": 15
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "type": "command",
+        "command": "echo [hook] PostToolUse: Bash exit={tool_response.exit_code}",
+        "timeout": 10
+      },
+      {
+        "name": "auto-deposit-buffer",
+        "matcher": "^mcp__(playwright|ghidra-mcp|deepcode-decompiler)__",
+        "type": "command",
+        "command": "python3 F:/DEEPCODE/scripts/auto_deposit_hook.py",
+        "timeout": 10
+      }
+    ],
+    "//_cerebellum_migrated_20260826": "SessionStart/PreCompact → .deepcode/hooks.json; PostTask/SessionEnd/OnError → 引擎不支持此事件, 经验提炼已合并到 PreCompact",
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "echo [hook] Session started at {timestamp}"
+      },
+      {
+        "type": "command",
+        "command": "cmd /c start /b python3 F:/DEEPCODE/scripts/update_pr_doc.py",
+        "timeout": 5
+      }
+    ],
+    "Route": [],
+    "OnError": [],
+    "PreTask": [],
+    "PostTask": [],
+    "Stop": [],
+    "SessionEnd": [
+      {
+        "name": "auto-deposit-flush",
+        "type": "command",
+        "command": "cmd /c start /b python3 F:/DEEPCODE/scripts/auto_deposit_hook.py --flush",
+        "timeout": 5
+      }
+    ],
+    "PreCompact": [
+      {
+        "name": "token-saver-prewarm",
+        "type": "command",
+        "command": "python3 F:/DEEPCODE/core/mcp_servers/token_saver_mcp_server.py --cli prewarm || echo [token-saver] prewarm 跳过 (Ollama 不可用)",
+        "timeout": 120
+      }
+    ]
+  },
+  "enabledSkills": {
+    "//note": "仅列出实际存在于 .deepcode/skills/ 的 Skills",
+    "model-provider-connect": true,
+    "deepcode-agent": true,
+    "deepcode-auth": true,
+    "deepcode-chrome": true,
+    "deepcode-hooks": true,
+    "deepcode-project-rules": true,
+    "deepcode-reverse-engineering": true,
+    "deepcode-sandbox": true,
+    "deepcode-starlark": true,
+    "deepcode-streaming": true,
+    "deepcode-telemetry": true,
+    "deepcode-knowledge": true,
+    "deepcode-workflow": true,
+    "ensemble": true,
+    "harmony-next": true,
+    "planning-with-files": true,
+    "schematic": true,
+    "//reverse-skill-note": "逆向 skill 全家桶（zhaoxuya520/reverse-skill 适配 2026-08-01）：核心逆向启用、低频场景禁用",
+    "dsl-vm-reverse": true,
+    "ida-reverse": true,
+    "js-reverse": true,
+    "malware-analysis": true,
+    "apk-reverse": true,
+    "ghidra-reverse": true,
+    "reverse-engineering": true,
+    "radare2": true,
+    "dotnet-reverse": true,
+    "go-rust-reverse": true,
+    "mobile-reverse": true,
+    "firmware-pentest": true,
+    "pwn-chain": true,
+    "patch-diff-exploit": true,
+    "binary-diff": true,
+    "edr-bypass-re": true,
+    "pentest-tools": true,
+    "src-hunter": true,
+    "attack-chain": true,
+    "protocol-reverse": true,
+    "api-security": true,
+    "llm-security": true,
+    "browser-automation": true,
+    "browser-extension-reverse": true,
+    "diagram-generator": true,
+    "docs-generator": true,
+    "code-audit": true,
+    "windows-ad": true,
+    "//reverse-skill-disabled": "低频场景（默认禁用，按需改为 true 启用）",
+    "radio-sdr": true,
+    "hardware-security": true,
+    "ot-ics": true,
+    "cloud-k8s": true,
+    "email-security": true,
+    "database-security": true,
+    "identity-federation": true,
+    "wifi-wireless": true,
+    "macos-reverse": true,
+    "supply-chain-security": true,
+    "threat-hunting": true,
+    "digital-forensics": true,
+    "thick-client": true,
+    "dsh-harness-repair": true,
+    "//_paper-skills-20260827": "基于顶级 AI 论文新增的 4 个技能（2026-08-27）",
+    "agentic-quality-assurance": true,
+    "loop-engineering": true,
+    "agent-design-patterns": true,
+    "cost-aware-routing": true,
+    "//_sync-skill-20260827": "DSH to DEEPCODE cross-project sync mechanism",
+    "dsh-to-deepcode-sync": true,
+    "//_paper-radar-20260827": "paper to capability pipeline",
+    "paper-radar": true,
+    "//_self-harness-20260827": "Self-Harness paper arXiv:2606.09498",
+    "self-harness": true,
+    "//_local-model-20260827": "local small model scenarios guide",
+    "local-model-scenarios": true
+  },
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "modes": {
+      "acceptEdits": {
+        "description": "Auto-accept edits, ask for dangerous operations"
+      },
+      "auto": {
+        "description": "Auto-accept everything"
+      },
+      "bypassPermissions": {
+        "description": "Bypass all permission checks"
+      },
+      "manual": {
+        "description": "Ask before every operation"
+      },
+      "dontAsk": {
+        "description": "Silently allow all (same as auto)"
+      },
+      "plan": {
+        "description": "Plan mode: analyze and propose, never execute"
+      }
+    },
+    "allow": [
+      "read-out-cwd",
+      "write-in-cwd",
+      "mcp",
+      "read-in-cwd",
+      "network",
+      "write-out-cwd",
+      "delete-in-cwd",
+      "query-git-log",
+      "mutate-git-log",
+      "delete-out-cwd",
+      "write-in-cwd"
+    ],
+    "deny": [],
+    "ask": []
+  },
+  "strictMcpConfig": false,
+  "//_harness_enhancements": "P0-P2 improvements added 2026-08-27 based on Western harness best practices (SandBase, awesome-harness-engineering)",
+  "sandbox": {
+    "defaultBackend": "local",
+    "backends": {
+      "local": {
+        "enabled": true,
+        "type": "local"
+      },
+      "docker": {
+        "enabled": false,
+        "type": "docker",
+        "image": "node:22-slim",
+        "resources": {
+          "memory": "1g",
+          "cpu": 1
+        }
+      },
+      "e2b": {
+        "enabled": true,
+        "type": "e2b",
+        "apiKey": "${E2B_API_KEY}"
+      }
+    }
+  },
+  "credentials": {
+    "vault": {
+      "enabled": true,
+      "backend": "local",
+      "encryption": {
+        "algorithm": "aes-256-gcm",
+        "keyDerivation": "pbkdf2",
+        "iterations": 600000
+      },
+      "autoLock": {
+        "timeout": 900,
+        "onIdle": true
+      }
+    }
+  },
+  "approval": {
+    "highRisk": {
+      "required": true,
+      "approvers": [
+        "@Zongwei9888"
+      ],
+      "label": "security",
+      "autoAssign": true
+    },
+    "mediumRisk": {
+      "required": true,
+      "approvers": [],
+      "autoAssign": false
+    }
+  },
+  "session": {
+    "stream": {
+      "enabled": true,
+      "backend": "sqlite",
+      "retention": "30d",
+      "resumable": true
+    }
+  },
+  "telemetry": {
+    "enabled": false,
+    "exporter": "deepcode-telemetry",
+    "endpoint": "http://127.0.0.1:4318",
+    "serviceName": "deepcode-harness",
+    "sampling": {
+      "traces": 1,
+      "metrics": 1
+    },
+    "instrumentation": {
+      "http": true,
+      "filesystem": true
+    }
+  },
+  "pluginUrls": [],
+  "mcpServers": {
+    "deepcode-cerebellum": {
+      "command": "python",
+      "args": [
+        "F:/DEEPCODE/.deepcode/skills/deepcode-cerebellum/cerebellum_mcp_server.py",
+        "--mcp"
+      ],
+      "env": {
+        "CEREBELLUM_OLLAMA_HOST": "http://127.0.0.1:11434",
+        "CEREBELLUM_LLM_MODEL": "qwen2.5:3b",
+        "CEREBELLUM_REASON_MODEL": "deepseek-r1:1.5b",
+        "CEREBELLUM_EMBED_MODEL": "bge-m3",
+        "CEREBELLUM_DB": "F:/DEEPCODE/.deepcode/skills/deepcode-cerebellum/data/cerebellum.db"
+      }
+    },
+    "router-mcp": {
+      "command": "python3",
+      "args": [
+        "F:/DEEPCODE/core/mcp_servers/router_mcp_server.py"
+      ]
+    },
+    "verifier-mcp": {
+      "command": "python3",
+      "args": [
+        "F:/DEEPCODE/core/mcp_servers/verifier_mcp_server.py"
+      ]
+    },
+    "h1-brain": {
+      "command": "F:/DS-HARNESS/tools/h1-brain/venv/Scripts/python.exe",
+      "args": [
+        "F:/DS-HARNESS/tools/h1-brain/server.py"
+      ],
+      "env": {
+        "H1_USERNAME": "raymondginger",
+        "H1_API_TOKEN": "E/7iz25rm36XIJ4bOMa/cjL+s8DnnpH8VF5res2lDc8="
+      }
+    },
+    "deepcode-agent-sdk": {
+      "command": "python",
+      "args": [
+        "F:/DEEPCODE/.deepcode/skills/deepcode-agent-sdk/agent_sdk_server.py",
+        "--mcp"
+      ],
+      "env": {
+        "DEEPSEEK_API_KEY": "${DEEPSEEK_API_KEY}"
+      }
+    }
+  },
+  "provider": {
+    "active": "mimo",
+    "defaultModel": "mimo-v2.5",
+    "profiles": {
+      "mimo": {
+        "apiBase": "https://token-plan-cn.xiaomimimo.com/v1",
+        "apiKey": "${XIAOMI_TOKEN_PLAN_CN_API_KEY}",
+        "manualModels": [
+          "mimo-v2.5-pro",
+          "mimo-v2.5",
+          "mimo-v2.5-flash"
+        ]
+      },
+      "deepseek": {
+        "apiBase": "https://api.deepseek.com",
+        "apiKey": "${DEEPSEEK_API_KEY}",
+        "manualModels": [
+          "deepseek-v4-flash",
+          "deepseek-v4-pro",
+          "deepseek-v4-flash-vision-exp",
+          "deepseek-v3.2"
+        ]
+      },
+      "anthropic": {
+        "apiBase": "https://api.anthropic.com",
+        "apiKey": "${ANTHROPIC_API_KEY}",
+        "manualModels": [
+          "claude-sonnet-4",
+          "claude-opus-4",
+          "claude-fable-5",
+          "claude-3-5-sonnet-20241022"
+        ]
+      },
+      "siliconflow": {
+        "apiBase": "https://api.siliconflow.cn/v1",
+        "apiKey": "${DEEPSEEK_API_KEY}",
+        "manualModels": [
+          "zai-org/GLM-5.2",
+          "deepseek-ai/DeepSeek-V4-Flash",
+          "deepseek-ai/DeepSeek-V3.2",
+          "deepseek-ai/DeepSeek-V4-Pro"
+        ]
+      },
+      "zhipu": {
+        "apiBase": "https://open.bigmodel.cn/api/paas/v4",
+        "apiKey": "${ZHIPU_API_KEY}",
+        "manualModels": [
+          "glm-5.2",
+          "glm-4-flash",
+          "glm-4-plus"
+        ]
+      },
+      "scnet": {
+        "apiBase": "https://api.scnet.cn/api/llm/v1",
+        "apiKey": "sk-tp-NDIyLTEyMjE4NjUyNDUzLTE3ODczMTcxMjM3MzI=",
+        "manualModels": [
+          "GLM-5.2",
+          "DeepSeek-V4-Flash",
+          "DeepSeek-V4-Pro",
+          "Kimi-K3",
+          "Qwen3.8-Max",
+          "DeepSeek-V3.2"
+        ]
+      },
+      "ollama": {
+        "apiBase": "http://127.0.0.1:11434/v1",
+        "apiKey": "ollama",
+        "manualModels": [
+          "qwen3:8b",
+          "qwen2.5-coder:3b",
+          "deepseek-r1:1.5b",
+          "phi4-mini"
+        ]
+      }
+    }
+  }
+}

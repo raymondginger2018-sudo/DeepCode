@@ -1,0 +1,143 @@
+---
+name: docs-generator
+description: >
+  生成任务导向的技术文档（渐进式披露）。用于编写 README、API 文档、架构文档或 Markdown 文档；也用于逆向/渗透/CTF/安全分析任务结束时在项目目录生成正式报告。触发关键词：写报告、写文档、出报告、writeup、技术文档、report、documentation。
+version: 1.0.0
+author: DeepCode (adapted from zhaoxuya520/reverse-skill)
+source: https://github.com/zhaoxuya520/reverse-skill
+date: 2026-08-01
+tags: [reverse, security]
+---
+# Technical Documentation
+
+
+## 安全/逆向任务文档输出
+
+当逆向/渗透/CTF/安全分析任务完成后，本 skill 负责在**用户项目目录**生成正式技术文档。
+
+### 触发时机
+
+1. 逆向任务完成，已产出核心结论（算法还原、签名破解、绕过方案等）
+2. 渗透测试完成，已发现并验证漏洞
+3. CTF 题目解出，已拿到 flag
+4. 用户明确要求"写一份报告/文档/writeup"
+
+### 模板选择
+
+| 任务类型 | 使用模板 |
+|---------|---------|
+| APK/二进制/so 逆向 | `references/security-report-templates.md` → 逆向工程报告 |
+| 渗透测试/漏洞挖掘 | `references/security-report-templates.md` → 渗透测试报告 |
+| CTF 解题 | `references/security-report-templates.md` → CTF Writeup |
+| JS/Web 签名逆向 | `references/security-report-templates.md` → 签名逆向报告 |
+| 通用技术文档 | `references/templates.md` → README / API 文档 |
+
+### 输出规范
+
+- **输出位置**：用户当前项目目录（不是 skill 包目录）
+- **文件名格式**：`YYYY-MM-DD_[类型]-[目标简称]-report.md`
+- **如果项目有 `docs/` 目录**：优先放在 `docs/` 下
+- **编码**：UTF-8
+- **语言**：跟随用户对话语言（中文对话出中文报告，英文对话出英文报告）
+
+### 质量要求
+
+- 所有代码块必须可直接运行或有明确上下文
+- 不要有 placeholder/TODO
+- 关键发现必须有证据支撑
+- 复现步骤必须让第三方能独立重现
+- 敏感信息（真实 token、密码、内部 URL）用占位符替代
+- **MUST** 包含 Evidence → Finding → Path 链（见 `../ops/evidence-finding-path.md` 与模板 §0）
+- **SHOULD** 引用 case `scope.md` / `timeline.md`（`../scripts/case-init.ps1`）
+
+### 图表集成
+
+生成报告时，应在适当位置调用 `diagram-generator` skill 生成可视化图表：
+
+| 报告类型 | 建议图表 | 图表类型 |
+|---------|---------|---------|
+| 逆向工程报告 | 函数调用关系图、数据流图 | Mermaid flowchart / sequenceDiagram |
+| 渗透测试报告 | 攻击路径图、网络拓扑图 | Mermaid flowchart / Graphviz |
+| CTF Writeup | 解题思路流程图 | Mermaid flowchart |
+| JS 签名逆向报告 | 请求链路时序图、算法流程图 | Mermaid sequenceDiagram / flowchart |
+
+图表以 Mermaid 代码块形式嵌入报告 markdown 中，确保可在 GitHub/GitLab 直接渲染。
+
+---
+
+## Core Principles
+
+### 1. Progressive Disclosure
+
+Reveal information in layers:
+
+| Layer | Content | User Question |
+|-------|---------|---------------|
+| 1 | One-sentence description | What is it? |
+| 2 | Quick start code block | How do I use it? |
+| 3 | Full API reference | What are my options? |
+| 4 | Architecture deep dive | How does it work? |
+
+**Warnings, breaking changes, and prerequisites go at the TOP.**
+
+### 2. Task-Oriented Writing
+
+```markdown
+<!-- Bad: Feature-oriented -->
+## AuthService Class
+The AuthService class provides authentication methods...
+
+<!-- Good: Task-oriented -->
+## Authenticating Users
+To authenticate a user, call login() with credentials:
+```
+
+### 3. Show, Don't Tell
+
+Every concept needs a concrete example.
+
+## Formatting Standards
+
+- **Sentence case headings**: "Getting started" not "Getting Started"
+- **Max 3 heading levels**: Deeper means split the doc
+- **Always specify language** in code blocks
+- **Relative paths** for internal links
+- **Tables** for structured data with 3+ attributes
+
+## Quality Checklist
+
+- [ ] Code examples tested and runnable
+- [ ] No placeholder text or TODOs
+- [ ] Matches actual code behavior
+- [ ] Scannable without reading everything
+- [ ] Reader knows what to do next
+
+## Anti-Patterns
+
+| Problem | Fix |
+|---------|-----|
+| Wall of text | Break up with headings, bullets, code, tables |
+| Buried critical info | Warnings/breaking changes at TOP |
+| Missing error docs | Always document what can go wrong |
+
+## Templates
+
+For README, API endpoint, and file organization templates, see [references/templates.md](references/templates.md).
+
+## Related Skills
+
+- `Skill(ce:writer)` - Writing style, tone, and voice (load The Engineer persona)
+- `Skill(ce:visualizing-with-mermaid)` - Architecture and flow diagrams
+
+
+---
+
+
+
+
+## 任务完成自检（声称完成前 MUST 通过）
+
+- [ ] 我是否执行了本 skill 的工作流（而不是只阅读）？
+- [ ] 是否产出可复现证据（命令/脚本/输出/报告）？
+- [ ] 分析操作是否在授权范围内进行？
+- [ ] 结论是否沉淀（可存入 deepcode-knowledge 知识库）？
